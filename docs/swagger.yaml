@@ -1,0 +1,730 @@
+openapi: 3.0.0
+info:
+  title: Al Bayyan API
+  version: 1.0.0
+  description: API documentation for Al Bayyan Admin and Delivery Agent App.
+
+servers:
+  - url: http://localhost:3002
+    description: Development server
+  - url: https://al-bayyan-backend.onrender.com
+    description: Production server (TBD — placeholder until a real deploy target exists)
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ValidationError:
+      type: object
+      properties:
+        status:
+          type: string
+          example: error
+        message:
+          type: string
+          example: Validation failed
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            name: ["Name is required"]
+            email: ["Invalid email"]
+            password: ["Password must be at least 6 characters"]
+
+    ConflictError:
+      type: object
+      properties:
+        status:
+          type: string
+          example: error
+        message:
+          type: string
+          example: User already exists
+
+    SuccessResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+        data:
+          type: object
+
+  responses:
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+paths:
+  # --- Auth APIs ---
+  /api/V1/auth/login:
+    post:
+      tags:
+        - Auth
+      summary: Admin/Vendor login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+
+
+      responses:
+        '200':
+          description: Login successful
+
+  # --- Admin Delivery Agent APIs ---
+  /api/V1/admin/delivery-agent/create:
+    post:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Create a new delivery agent
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, email, mobile, password]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                mobile: { type: string, example: "1234567890" }
+                password: { type: string, minLength: 6 }
+                vehicle_type: { type: string, enum: [bike, car, van, other] }
+                status: { type: string, enum: [active, inactive] }
+                avatar: { type: string, format: binary }
+      responses:
+        '201':
+          description: Agent created successfully
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/V1/admin/delivery-agent/list:
+    get:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Get all delivery agents (Paginated)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: List of agents fetched successfully
+
+  /api/V1/admin/delivery-agent/update/{id}:
+    put:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Update a delivery agent (Excluding Password)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                mobile: { type: string }
+                vehicle_type: { type: string, enum: [bike, car, van, other] }
+                status: { type: string, enum: [active, inactive] }
+                avatar: { type: string, format: binary }
+      responses:
+        '200':
+          description: Agent updated successfully
+  /api/V1/admin/delivery-agent/update-password/{id}:
+    put:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Update a delivery agent's password
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 6 }
+      responses:
+        '200':
+          description: Password updated successfully
+
+  /api/V1/admin/delivery-agent/delete/{id}:
+    delete:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Delete a delivery agent
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Agent deleted successfully
+
+  /api/V1/admin/delivery-agent/assign-order:
+    post:
+      tags:
+        - Delivery Agent (Admin)
+      summary: Assign an agent to an order
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, agent_id]
+              properties:
+                order_id: { type: string }
+                agent_id: { type: string }
+      responses:
+        '200':
+          description: Agent assigned to order successfully
+
+  # --- Delivery Agent Mobile App APIs ---
+  /api/V1/agent/delivery-agent/login:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Login for delivery agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                email: { type: string, format: email }
+                mobile: { type: string }
+                password: { type: string }
+
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Login successful }
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      _id: { type: string }
+                      name: { type: string }
+                      email: { type: string }
+                      mobile: { type: string }
+                      vehicle_type: { type: string }
+                      status: { type: string }
+                      avatar: { type: string, nullable: true }
+        '401':
+          description: Invalid email or password
+
+  /api/V1/agent/delivery-agent/refresh-token:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Refresh access token for delivery agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: Token refreshed successfully
+        '401':
+          description: Invalid refresh token
+        '403':
+          description: Forbidden
+
+  /api/V1/agent/delivery-agent/update-profile:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Update delivery agent profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                mobile: { type: string }
+                vehicle_type: { type: string, enum: [bike, car, van, other] }
+                avatar: { type: string, format: binary }
+      responses:
+        '200':
+          description: Profile updated successfully
+
+  /api/V1/agent/delivery-agent/change-password:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Change password for delivery agent
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oldPassword, newPassword]
+              properties:
+                oldPassword: { type: string }
+                newPassword: { type: string, minLength: 6 }
+      responses:
+        '200':
+          description: Password changed successfully
+        '400':
+          description: Invalid input or passwords are same
+        '401':
+          description: Incorrect old password
+
+  /api/V1/agent/delivery-agent/forgot-password:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Request password reset OTP (Email or Mobile)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mobile: { type: string, description: "Provide either mobile or email" }
+                email: { type: string, format: email, description: "Provide either mobile or email" }
+      responses:
+        '200':
+          description: OTP sent successfully (Default 555555)
+
+  /api/V1/agent/delivery-agent/verify-otp:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Verify the reset OTP (Email or Mobile)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otp]
+              properties:
+                mobile: { type: string, description: "Provide the same identifier used in forgot-password" }
+                email: { type: string, format: email, description: "Provide the same identifier used in forgot-password" }
+                otp: { type: integer, example: 555555 }
+      responses:
+        '200':
+          description: OTP verified successfully
+
+  /api/V1/agent/delivery-agent/reset-password:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Reset password after OTP verification (Email or Mobile)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                mobile: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 6 }
+      responses:
+        '200':
+          description: Password reset successfully
+
+  /api/V1/agent/delivery-agent/dashboard-stats:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get agent dashboard statistics (Status, Current Order, Recent Activity)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Stats fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      pending_count: { type: integer }
+                      delivered_count: { type: integer }
+                      current_order: { type: object, nullable: true }
+                      recent_activity:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            order_id: { type: string }
+                            delivered_at: { type: string, format: date-time }
+                            total_price: { type: number }
+                            shipping_address: { type: object }
+
+  /api/V1/agent/delivery-agent/assigned-orders:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get all orders assigned to the current agent
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: ['Pending', 'Picked Up', 'Delivered', 'Cancelled'] }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 10 }
+      responses:
+        '200':
+          description: List of assigned orders fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+                  data: { type: array, items: { type: object } }
+
+  /api/V1/agent/delivery-agent/order-detail/{id}:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get detailed information for a specific order
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Order details fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '404':
+          description: Order not found
+        '403':
+          description: Access denied
+
+  /api/V1/agent/delivery-agent/update-delivery-status/{id}:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Update the delivery status (Picked Up / Delivered / Cancelled)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: ['Picked Up', 'Delivered', 'Cancelled'] }
+      responses:
+        '200':
+          description: Delivery status updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string }
+                  data: { type: object }
+
+  /api/V1/agent/delivery-agent/profile:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get delivery agent profile with total delivered count
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Profile data fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      total_delivered_count: { type: integer }
+                      _id: { type: string }
+                      name: { type: string }
+                      email: { type: string }
+                      mobile: { type: string }
+                      vehicle_type: { type: string }
+                      status: { type: string }
+                      avatar: { type: string, nullable: true }
+                      createdAt: { type: string, format: date-time }
+                      updatedAt: { type: string, format: date-time }
+  
+  /api/V1/agent/delivery-agent/notifications:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get all notifications for the delivery agent
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 15 }
+      responses:
+        '200':
+          description: Notifications fetched successfully
+
+  /api/V1/agent/delivery-agent/notifications/unread-count:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get the unread notification count
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Unread count fetched successfully
+
+  /api/V1/agent/delivery-agent/notifications/read:
+    patch:
+      tags:
+        - Delivery Agent (App)
+      summary: Mark notifications as read
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notification_ids:
+                  type: array
+                  items:
+                    type: string
+                  description: Array of notification IDs. If omitted, marks all as read.
+      responses:
+        '200':
+          description: Notifications marked as read successfully
+
+  # --- Customer App APIs ---
+  /api/V1/orders/customer/{customerId}:
+    get:
+      tags:
+        - Customer App
+      summary: Get all orders for a specific customer
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Numeric ID of the customer (Shopify ID)
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: List of customer orders fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  total: { type: integer, example: 100 }
+                  page: { type: integer, example: 1 }
+                  limit: { type: integer, example: 10 }
+                  totalPages: { type: integer, example: 10 }
+                  results: { type: integer, example: 10 }
+                  data:
+                    type: array
+                    items:
+                      type: object
+
+  /api/V1/orders/customer/{customerId}/{orderId}:
+    get:
+      tags:
+        - Customer App
+      summary: Get detailed information for a specific order of a customer
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Numeric ID of the customer
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The Shopify Order ID
+      responses:
+        '200':
+          description: Order details fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string }
+                  data: { type: object }
+        '404':
+          description: Order not found
+
+  # --- Admin Management APIs ---
+  /api/V1/users:
+    get:
+      tags: [Admin Management]
+      summary: Get all users
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Success }
+    post:
+      tags: [Admin Management]
+      summary: Create user
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: Created }
+
+  /api/V1/roles:
+    get:
+      tags: [Admin Management]
+      summary: Get all roles
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Success }
+    post:
+      tags: [Admin Management]
+      summary: Create role
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: Created }
+
+  /api/V1/permissions:
+    get:
+      tags: [Admin Management]
+      summary: Get all permissions
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Success }
+
+  # --- Orders Management APIs ---
+  /api/V1/orders:
+    get:
+      tags: [Orders]
+      summary: Get all orders
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Success }
