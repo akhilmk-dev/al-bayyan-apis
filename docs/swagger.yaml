@@ -288,7 +288,9 @@ paths:
                 agent_id: { type: string }
       responses:
         '200':
-          description: Agent assigned to order successfully
+          description: Agent assigned to order successfully. Sets assignment_status to pending_acceptance - the agent must accept or reject it via the app.
+        '400':
+          description: Order already fulfilled, or this agent previously rejected this order
 
   # --- Delivery Agent Mobile App APIs ---
   /api/V1/agent/delivery-agent/login:
@@ -629,6 +631,75 @@ paths:
                           updated_at: { type: string, format: date-time }
         '400':
           description: Order is not currently Picked Up
+        '403':
+          description: Not assigned to this order
+        '404':
+          description: Order not found
+
+  /api/V1/agent/delivery-agent/orders/{id}/accept:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Accept an assigned order (moves it straight to Picked Up - no separate manual pickup step)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Order accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string }
+                  data: { type: object }
+        '400':
+          description: Order is not awaiting acceptance (already accepted/rejected, or not Pending)
+        '403':
+          description: Not assigned to this order
+        '404':
+          description: Order not found
+
+  /api/V1/agent/delivery-agent/orders/{id}/reject:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Reject an assigned order (clears the assignment; this agent is excluded from future reassignment for this order)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, example: "Vehicle broke down" }
+      responses:
+        '200':
+          description: Order rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string }
+                  data: { type: object }
+        '400':
+          description: Missing reason, or order is not awaiting acceptance
         '403':
           description: Not assigned to this order
         '404':

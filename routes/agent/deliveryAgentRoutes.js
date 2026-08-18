@@ -6,6 +6,7 @@ const { uploadAgentAvatar } = require('../../middleware/uploadMiddleware');
 const notificationController = require('../../controllers/notificationController');
 const validateMiddleware = require('../../utils/validate');
 const { locationSchema } = require('../../validations/locationValidation');
+const { rejectOrderSchema } = require('../../validations/rejectOrderValidation');
 
 router.post('/login', deliveryAgentController.loginAgent);
 router.post('/refresh-token', deliveryAgentController.refreshToken);
@@ -19,6 +20,8 @@ router.get('/earnings', authenticate, deliveryAgentController.getEarnings);
 router.get('/assigned-orders', authenticate, deliveryAgentController.getAssignedOrders);
 router.get('/order-detail/:id', authenticate, deliveryAgentController.getOrderDetail);
 router.put('/update-delivery-status/:id', authenticate, deliveryAgentController.updateDeliveryStatus);
+router.put('/orders/:id/accept', authenticate, deliveryAgentController.acceptOrder);
+router.put('/orders/:id/reject', authenticate, validateMiddleware(rejectOrderSchema), deliveryAgentController.rejectOrder);
 router.put('/update-location/:id', authenticate, validateMiddleware(locationSchema), deliveryAgentController.updateLiveLocation);
 router.put('/update-profile', authenticate, uploadAgentAvatar.single('avatar'), deliveryAgentController.updateProfile);
 router.put('/change-password', authenticate, deliveryAgentController.changePasswordAgent);

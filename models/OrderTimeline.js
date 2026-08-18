@@ -4,7 +4,7 @@ const orderTimelineSchema = new mongoose.Schema({
   order_id: { type: String, required: true }, 
   action: {
     type: String,
-    enum: ['created', 'updated', 'cancelled', 'deleted','Fulfilled',"MarkAsPaid", 'Assigned', 'Picked Up', 'Delivered', 'Reassigned'],
+    enum: ['created', 'updated', 'cancelled', 'deleted','Fulfilled',"MarkAsPaid", 'Assigned', 'Picked Up', 'Delivered', 'Reassigned', 'Accepted', 'Rejected'],
     required: true
   },
   timestamp: { type: Date, default: Date.now },

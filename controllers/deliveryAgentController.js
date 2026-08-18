@@ -195,10 +195,17 @@ exports.assignAgentToOrder = catchAsync(async (req, res, next) => {
     const agent = await DeliveryAgent.findById(agent_id);
     if (!agent) throw new NotFoundError('Agent not found');
 
+    const alreadyRejected = order.rejected_agents?.some(r => r.agent_id?.toString() === agent_id);
+    if (alreadyRejected) {
+        return res.status(400).json({ status: 'error', message: 'This agent already rejected this order and cannot be reassigned to it' });
+    }
+
     const previousAgent = order.assigned_agent;
     order.assigned_agent = agent_id;
+    order.agent_type = 'DeliveryAgent';
     order.assignment_date = new Date();
     order.delivery_status = 'Pending';
+    order.assignment_status = 'pending_acceptance';
     await order.save();
 
     // Send push notification to the assigned delivery agent
@@ -692,6 +699,96 @@ exports.updateLiveLocation = catchAsync(async (req, res, next) => {
     await order.save();
 
     res.status(200).json({ status: 'success', data: { current_location: order.current_location } });
+});
+
+// Accept an assigned order. Moves delivery_status straight to 'Picked Up' -
+// there is no separate manual "mark as picked up" step once accept exists.
+exports.acceptOrder = catchAsync(async (req, res, next) => {
+    const order = await Order.findById(req.params.id);
+    if (!order) throw new NotFoundError('Order not found');
+
+    if (!order.assigned_agent || order.assigned_agent.toString() !== req.user.id) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Access denied: You are not assigned to this order or the order is unassigned'
+        });
+    }
+
+    // assignment_status may be null for orders assigned before this feature
+    // existed - treat that the same as 'pending_acceptance'.
+    if (order.assignment_status && order.assignment_status !== 'pending_acceptance') {
+        return res.status(400).json({
+            status: 'error',
+            message: `This order has already been ${order.assignment_status}`
+        });
+    }
+    if (order.delivery_status !== 'Pending') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Only a Pending order awaiting acceptance can be accepted'
+        });
+    }
+
+    order.assignment_status = 'accepted';
+    order.delivery_status = 'Picked Up';
+    order.picked_up_at = new Date();
+    order.fulfillment_status = 'scheduled';
+    await order.save();
+
+    await OrderTimeline.create({
+        order_id: order.order_id,
+        action: 'Accepted',
+        message: 'Order accepted by delivery agent'
+    });
+
+    res.status(200).json({ status: 'success', message: 'Order accepted', data: order });
+});
+
+// Reject an assigned order. Clears the assignment so admin can reassign to a
+// different agent; this agent is recorded so they're never reassigned to the
+// same order again.
+exports.rejectOrder = catchAsync(async (req, res, next) => {
+    const { reason } = req.body;
+    const order = await Order.findById(req.params.id);
+    if (!order) throw new NotFoundError('Order not found');
+
+    if (!order.assigned_agent || order.assigned_agent.toString() !== req.user.id) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Access denied: You are not assigned to this order or the order is unassigned'
+        });
+    }
+
+    if (order.assignment_status && order.assignment_status !== 'pending_acceptance') {
+        return res.status(400).json({
+            status: 'error',
+            message: `This order has already been ${order.assignment_status}`
+        });
+    }
+    if (order.delivery_status !== 'Pending') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Only a Pending order awaiting acceptance can be rejected'
+        });
+    }
+
+    order.rejected_agents.push({
+        agent_id: req.user.id,
+        reason,
+        rejected_at: new Date()
+    });
+    order.assigned_agent = null;
+    order.assignment_date = null;
+    order.assignment_status = 'rejected';
+    await order.save();
+
+    await OrderTimeline.create({
+        order_id: order.order_id,
+        action: 'Rejected',
+        message: `Order rejected by delivery agent: ${reason}`
+    });
+
+    res.status(200).json({ status: 'success', message: 'Order rejected', data: order });
 });
 
 // Helper for formatting agent with full avatar

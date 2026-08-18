@@ -80,6 +80,17 @@ const orderSchema = new mongoose.Schema({
   modified_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   assignment_date: { type: Date, default: null },
   delivery_status: { type: String, enum: ['Pending', 'Picked Up', 'Delivered', 'Cancelled'], default: 'Pending' },
+  // Tracks the current assignment's accept/reject handshake, independent of
+  // delivery_status. Accepting moves delivery_status straight to 'Picked Up'
+  // (no separate manual pickup step); rejecting clears the assignment.
+  assignment_status: { type: String, enum: ['pending_acceptance', 'accepted', 'rejected'], default: null },
+  // Persistent history of agents who rejected this order, so they're excluded
+  // from being reassigned to it again. Accumulates across reassignment cycles.
+  rejected_agents: [{
+    agent_id: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryAgent' },
+    reason: { type: String },
+    rejected_at: { type: Date, default: Date.now }
+  }],
   picked_up_at: { type: Date, default: null },
   delivered_at: { type: Date, default: null },
   current_location: {
