@@ -40,6 +40,7 @@ app.use('/api/V1/items', itemRoutes);
 app.use('/api/V1/permissions', permissionRoutes);
 app.use('/api/V1/roles', roleRoutes);
 app.use('/api/V1/admin/delivery-agent', require('./routes/admin/deliveryAgentRoutes'));
+app.use('/api/V1/admin/settings', require('./routes/admin/settingsRoutes'));
 app.use('/api/V1/agent/delivery-agent', require('./routes/agent/deliveryAgentRoutes'));
 app.use('/api/V1/users', userRoutes);
 app.use('/api/V1/profile', profileRoutes);

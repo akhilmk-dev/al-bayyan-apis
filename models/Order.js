@@ -81,7 +81,12 @@ const orderSchema = new mongoose.Schema({
   assignment_date: { type: Date, default: null },
   delivery_status: { type: String, enum: ['Pending', 'Picked Up', 'Delivered', 'Cancelled'], default: 'Pending' },
   picked_up_at: { type: Date, default: null },
-  delivered_at: { type: Date, default: null }
+  delivered_at: { type: Date, default: null },
+  current_location: {
+    latitude: { type: Number, default: null },
+    longitude: { type: Number, default: null },
+    updated_at: { type: Date, default: null }
+  }
 });
 
 module.exports = mongoose.model('Order', orderSchema);

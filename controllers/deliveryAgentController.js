@@ -3,6 +3,8 @@ const DeliveryAgent = require('../models/DeliveryAgent');
 const Order = require('../models/Order');
 const Notification = require('../models/Notification');
 const OrderTimeline = require('../models/OrderTimeline');
+const Settings = require('../models/Settings');
+const AgentEarning = require('../models/AgentEarning');
 const catchAsync = require('../utils/catchAsync');
 const { NotFoundError, InternalServerError } = require('../utils/customErrors');
 const { generateAccessToken, generateRefreshToken } = require('../utils/generateTokens');
@@ -454,6 +456,38 @@ exports.getDeliveryStats = catchAsync(async (req, res, next) => {
     });
 });
 
+// Get Earnings (today / this month / total deliveries)
+exports.getEarnings = catchAsync(async (req, res, next) => {
+    const agentId = req.user.id;
+
+    // No timezone precedent exists elsewhere in this codebase — delivered_at
+    // is stored as a plain UTC Date, so boundaries are computed in UTC.
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+    const sumSince = async (since) => {
+        const result = await AgentEarning.aggregate([
+            { $match: { agent_id: new mongoose.Types.ObjectId(agentId), delivered_at: { $gte: since } } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]);
+        return result[0]?.total || 0;
+    };
+
+    const today_earnings = await sumSince(todayStart);
+    const month_earnings = await sumSince(monthStart);
+    const total_deliveries = await AgentEarning.countDocuments({ agent_id: agentId });
+
+    res.status(200).json({
+        status: 'success',
+        data: {
+            today_earnings,
+            month_earnings,
+            total_deliveries
+        }
+    });
+});
+
 // Get All Assigned Orders
 exports.getAssignedOrders = catchAsync(async (req, res, next) => {
     const agentId = req.user.id;
@@ -571,8 +605,54 @@ exports.updateDeliveryStatus = catchAsync(async (req, res, next) => {
         } else {
             console.warn(`Order ${order.order_id} has no fulfillment_id. Cannot sync to Shopify.`);
         }
+
+        // Credit delivery earnings. Only real DeliveryAgent assignees earn — a
+        // dashboard User who self-assigned via pickupOrder should not. Fails
+        // silently/logs, same as the Shopify sync above, so a ledger-write
+        // hiccup never blocks the delivery-status update itself.
+        if (order.agent_type === 'DeliveryAgent') {
+            try {
+                const settings = await Settings.getSingleton();
+                const rate = settings.delivery_earning_rate;
+
+                await AgentEarning.create({
+                    agent_id: order.assigned_agent,
+                    order_id: order._id,
+                    amount: rate,
+                    delivered_at: order.delivered_at,
+                });
+
+                const earningTitle = 'Delivery Completed 💰';
+                const earningMessage = `You earned ${rate} for this delivery.`;
+                const earningData = { id: order._id.toString(), order_id: order.order_id, type: 'earning_credited' };
+
+                await sendNotification(
+                    order.assigned_agent,
+                    earningTitle,
+                    earningMessage,
+                    earningData,
+                    `com.albayyan_staffapp://OrderDetail/${order._id.toString()}`
+                );
+
+                await Notification.create({
+                    agent_id: order.assigned_agent,
+                    title: earningTitle,
+                    message: earningMessage,
+                    data: earningData,
+                    is_read: false
+                });
+            } catch (err) {
+                console.error('Earnings crediting failed:', err);
+            }
+        }
     }
     if (status === 'Cancelled') order.cancelled_at = new Date();
+
+    // Live-tracking data is ephemeral - clear it once the order is no longer
+    // in transit, whichever terminal state it reaches.
+    if (status === 'Delivered' || status === 'Cancelled') {
+        order.current_location = undefined;
+    }
 
     await order.save();
 
@@ -585,6 +665,33 @@ exports.updateDeliveryStatus = catchAsync(async (req, res, next) => {
 
 
     res.status(200).json({ status: 'success', message: `Order status updated to ${status}`, data: order });
+});
+
+// Update Live Location (agent app pings this every 10-15s while delivering)
+exports.updateLiveLocation = catchAsync(async (req, res, next) => {
+    const { latitude, longitude } = req.body;
+    const order = await Order.findById(req.params.id);
+
+    if (!order) throw new NotFoundError('Order not found');
+
+    if (!order.assigned_agent || order.assigned_agent.toString() !== req.user.id) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Access denied: You are not assigned to this order or the order is unassigned'
+        });
+    }
+
+    if (order.delivery_status !== 'Picked Up') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Location updates are only accepted while the order is Picked Up'
+        });
+    }
+
+    order.current_location = { latitude, longitude, updated_at: new Date() };
+    await order.save();
+
+    res.status(200).json({ status: 'success', data: { current_location: order.current_location } });
 });
 
 // Helper for formatting agent with full avatar
@@ -646,6 +753,22 @@ exports.getAgentDetails = catchAsync(async (req, res, next) => {
     stats.forEach(s => {
         if (s._id) statsMap[s._id] = s.count;
     });
+
+    // Earnings summary (see getEarnings for the same UTC month-boundary convention)
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const [totalEarningsAgg, monthEarningsAgg] = await Promise.all([
+        AgentEarning.aggregate([
+            { $match: { agent_id: new mongoose.Types.ObjectId(id) } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]),
+        AgentEarning.aggregate([
+            { $match: { agent_id: new mongoose.Types.ObjectId(id), delivered_at: { $gte: monthStart } } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ])
+    ]);
+    statsMap.total_earnings = totalEarningsAgg[0]?.total || 0;
+    statsMap.this_month_earnings = monthEarningsAgg[0]?.total || 0;
 
     // Fetch orders with pagination and filter
     let query = { assigned_agent: id };

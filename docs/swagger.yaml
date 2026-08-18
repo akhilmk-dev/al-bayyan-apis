@@ -5,10 +5,10 @@ info:
   description: API documentation for Al Bayyan Admin and Delivery Agent App.
 
 servers:
-  - url: http://localhost:3002
+  - url: https://al-bayyan-apis.onrender.com
+    description: Production server
+  - url: http://localhost:5000
     description: Development server
-  - url: https://al-bayyan-backend.onrender.com
-    description: Production server (TBD — placeholder until a real deploy target exists)
 
 components:
   securitySchemes:
@@ -16,6 +16,10 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    trackingApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
 
   schemas:
     ValidationError:
@@ -89,6 +93,63 @@ paths:
       responses:
         '200':
           description: Login successful
+
+  /api/V1/auth/refresh-token:
+    post:
+      tags:
+        - Auth
+      summary: Refresh the admin/vendor access token
+      description: >
+        Exchanges a valid refresh token for a new access token + refresh token pair.
+        The refresh token must match the one currently stored on the user document
+        (`user.refresh_token`), otherwise the request is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+        '403':
+          description: Refresh token does not match the stored token (Forbidden)
+        '500':
+          description: >
+            Missing/invalid/expired refresh token. Note: both a missing `refreshToken`
+            in the body and a `jwt.verify` failure (expired/malformed token) resolve to
+            HTTP 500 here rather than 400/401 — the route does not distinguish them.
+
+  /api/V1/auth/logout:
+    post:
+      tags:
+        - Auth
+      summary: Log out the current admin/vendor session
+      description: >
+        Looks up the user by the supplied refresh token and clears `refresh_token` on
+        that user document, invalidating it for future `/refresh-token` calls. If no
+        user matches the token, the endpoint still responds 204 (no-op, no error surfaced).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '204':
+          description: Logged out successfully (no content)
 
   # --- Admin Delivery Agent APIs ---
   /api/V1/admin/delivery-agent/create:
@@ -526,6 +587,53 @@ paths:
                   message: { type: string }
                   data: { type: object }
 
+  /api/V1/agent/delivery-agent/update-location/{id}:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Push the agent's live coordinates for an order (called every 10-15s while Picked Up)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [latitude, longitude]
+              properties:
+                latitude: { type: number, example: 23.5880 }
+                longitude: { type: number, example: 58.3829 }
+      responses:
+        '200':
+          description: Location updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      current_location:
+                        type: object
+                        properties:
+                          latitude: { type: number }
+                          longitude: { type: number }
+                          updated_at: { type: string, format: date-time }
+        '400':
+          description: Order is not currently Picked Up
+        '403':
+          description: Not assigned to this order
+        '404':
+          description: Order not found
+
   /api/V1/agent/delivery-agent/profile:
     get:
       tags:
@@ -683,6 +791,64 @@ paths:
         '404':
           description: Order not found
 
+  /api/V1/orders/track/{orderId}:
+    get:
+      tags:
+        - Customer App
+      summary: Live tracking data for a single order (destination + agent's current position)
+      description: >
+        Authenticated via a single shared static API key (x-api-key header), not JWT -
+        intended for the external customer-facing tracking app, which already knows the
+        Shopify order ID from Shopify's own frontend API.
+      security:
+        - trackingApiKey: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The Shopify Order ID
+      responses:
+        '200':
+          description: Tracking data fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      order_id: { type: string }
+                      delivery_status: { type: string, enum: ['Pending', 'Picked Up', 'Delivered', 'Cancelled'] }
+                      destination:
+                        type: object
+                        properties:
+                          latitude: { type: number, nullable: true }
+                          longitude: { type: number, nullable: true }
+                      current_location:
+                        type: object
+                        nullable: true
+                        description: null once the order is Delivered/Cancelled, or if the agent hasn't pinged yet
+                        properties:
+                          latitude: { type: number }
+                          longitude: { type: number }
+                          updated_at: { type: string, format: date-time }
+                      agent:
+                        type: object
+                        nullable: true
+                        properties:
+                          name: { type: string }
+                          vehicle_type: { type: string, nullable: true }
+        '401':
+          description: Invalid or missing API key
+        '404':
+          description: Order not found
+        '503':
+          description: Tracking service not configured (TRACKING_API_KEY unset)
+
   # --- Admin Management APIs ---
   /api/V1/users:
     get:
@@ -720,11 +886,1487 @@ paths:
       responses:
         '200': { description: Success }
 
+  # --- Products APIs ---
+  /api/V1/products:
+    post:
+      tags: [Products]
+      summary: Create a product in Shopify and publish it to markets/collections
+      description: >
+        Requires the `Product Add` permission. Creates the product via the Shopify
+        Admin REST API, attaches it to the given collections (`collections.json`),
+        sets per-location inventory for every variant, then publishes it to the
+        given markets' catalogs via the Shopify GraphQL Admin API. If any step after
+        product creation throws, the created Shopify product is rolled back (deleted).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product]
+              properties:
+                product:
+                  type: object
+                  description: Shopify product payload, passed through to `POST /products.json`.
+                  properties:
+                    title: { type: string }
+                    body_html: { type: string }
+                    vendor: { type: string }
+                    product_type: { type: string }
+                    status: { type: string, enum: [active, draft, archived] }
+                    tags: { type: array, items: { type: string } }
+                    options:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name: { type: string }
+                          values: { type: array, items: { type: string } }
+                    variants:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          option1: { type: string }
+                          option2: { type: string }
+                          option3: { type: string }
+                          price: { type: string }
+                          sku: { type: string }
+                marketIds:
+                  type: array
+                  description: Shopify Market GIDs to publish the product's catalogs to.
+                  items: { type: string, example: "gid://shopify/Market/1" }
+                inventoryByVariant:
+                  type: object
+                  description: Map of variant SKU -> array of { locationId, quantity } to set inventory levels for.
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        locationId: { type: string, example: "gid://shopify/Location/1" }
+                        quantity: { type: integer }
+                collectionIds:
+                  type: array
+                  description: Shopify (custom) collection IDs to attach the product to.
+                  items: { type: string }
+      responses:
+        '201':
+          description: Product created & published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Product created & published }
+                  shopifyProductId: { type: integer }
+        '500':
+          description: Product creation failed (created Shopify product, if any, is rolled back)
+
+    get:
+      tags: [Products]
+      summary: Public storefront product listing (Shopify-backed, cursor paginated)
+      description: >
+        Public endpoint (no bearer token required) — used by the storefront/mobile
+        listing pages. If called with a bearer token belonging to a Vendor-role user,
+        results are automatically filtered to that vendor's own products. Backed by
+        Shopify's GraphQL product search (`title`/`vendor`/`collection_id` query
+        filters) with cursor-based pagination (`after`/`before`), not offset paging.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Matches against product title (`title:*search*`). Ignored when `collectionId` is set (client-side title filter is used instead in that case).
+        - name: vendor_name
+          in: query
+          schema: { type: string }
+          description: Filters by Shopify vendor. Forced to the caller's own name when the authenticated user has the Vendor role.
+        - name: collectionId
+          in: query
+          schema: { type: string }
+          description: Numeric Shopify collection ID. When set, results are additionally filtered client-side by `search` against the title.
+        - name: after
+          in: query
+          schema: { type: string }
+          description: GraphQL end cursor for the next page.
+        - name: before
+          in: query
+          schema: { type: string }
+          description: GraphQL start cursor for the previous page.
+      responses:
+        '200':
+          description: Products fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: array, items: { type: object } }
+                  pageInfo:
+                    type: object
+                    properties:
+                      hasNextPage: { type: boolean }
+                      hasPreviousPage: { type: boolean }
+                      startCursor: { type: string }
+                      endCursor: { type: string }
+                  total: { type: integer, description: Number of items in this page's `data` array. }
+                  totalPages: { type: integer, description: "Misnomer: this is actually the store's total product count (from /products/count.json), not a page count." }
+
+  /api/V1/products/market/All:
+    get:
+      tags: [Products]
+      summary: Get all Shopify markets
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Markets fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  markets: { type: array, items: { type: object } }
+        '500':
+          description: Failed to fetch markets
+
+  /api/V1/products/province/all:
+    get:
+      tags: [Products]
+      summary: Get the configured list of provinces (Shopify metafield definition)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Provinces fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: array, items: { type: string } }
+        '500':
+          description: Failed to fetch provinces
+
+  /api/V1/products/delete/{productId}:
+    delete:
+      tags: [Products]
+      summary: Delete a product
+      description: Requires the `Product Delete` permission. Deletes the product from Shopify, then removes the local Mongo mirror record (by `shopifyId`) if one exists.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: string }
+          description: Shopify numeric product ID
+      responses:
+        '200':
+          description: Product deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Product deleted successfully }
+                  product: { type: object, nullable: true, description: The deleted local Mongo mirror document, or null if none existed. }
+        '500':
+          description: Failed to delete product
+
+  /api/V1/products/{productId}:
+    get:
+      tags: [Products]
+      summary: Get full product detail (edit-form shaped payload)
+      description: >
+        Requires the `Product List` permission. Assembles a single response from
+        several Shopify REST/GraphQL calls (product, collects, metafields, per-variant
+        inventory levels, market publications) plus the local Mongo mirror, shaped to
+        be fed straight back into the update endpoint's request body.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: string }
+          description: Shopify numeric product ID
+      responses:
+        '200':
+          description: Product detail fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  marketIds: { type: array, items: { type: string } }
+                  collectionIds: { type: array, items: { type: integer } }
+                  product:
+                    type: object
+                    properties:
+                      id: { type: integer }
+                      title: { type: string }
+                      body_html: { type: string }
+                      vendor: { type: string }
+                      product_type: { type: string }
+                      handle: { type: string }
+                      price: { type: string }
+                      images: { type: array, items: { type: object } }
+                      status: { type: string }
+                      tags: { type: array, items: { type: string } }
+                      metafields:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            namespace: { type: string }
+                            key: { type: string }
+                            type: { type: string }
+                            value: { type: string }
+                      options:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            values: { type: array, items: { type: string } }
+                      variants:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            option1: { type: string }
+                            option2: { type: string }
+                            option3: { type: string }
+                            price: { type: string }
+                            sku: { type: string }
+                            tracked: { type: boolean }
+                  inventoryByVariant:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          locationId: { type: string }
+                          quantity: { type: integer }
+        '400':
+          description: productId is required
+        '500':
+          description: Failed to fetch product details
+
+  /api/V1/products/update/{productId}:
+    put:
+      tags: [Products]
+      summary: Update a product (core fields, metafields, inventory, collections, market publications)
+      description: >
+        Requires the `Product Edit` permission. Backs up the current Shopify product
+        first; if any step in the update fails, the original product is restored
+        (best-effort rollback via `PUT /products/{id}.json`).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product]
+              properties:
+                product:
+                  type: object
+                  properties:
+                    title: { type: string }
+                    body_html: { type: string }
+                    vendor: { type: string }
+                    product_type: { type: string }
+                    status: { type: string, enum: [active, draft, archived] }
+                    tags: { type: array, items: { type: string } }
+                    options: { type: array, items: { type: object } }
+                    variants:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          option1: { type: string }
+                          option2: { type: string }
+                          option3: { type: string }
+                          price: { type: string }
+                          sku: { type: string }
+                    metafields:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          namespace: { type: string }
+                          key: { type: string }
+                          type: { type: string }
+                          value: { type: string }
+                inventoryByVariant:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        locationId: { type: string }
+                        quantity: { type: integer }
+                collectionIds:
+                  type: array
+                  items: { type: string }
+                marketIds:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: Product updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Product updated successfully }
+                  data:
+                    type: object
+                    properties:
+                      shopify: { type: object }
+        '400':
+          description: productId is required
+        '500':
+          description: Failed to update product (original product is restored on Shopify)
+
+  /api/V1/products/product-delete:
+    post:
+      tags: [Products]
+      summary: Shopify product-delete webhook receiver
+      description: >
+        **Public endpoint — not authenticated.** Real Shopify webhook calls carry no
+        bearer JWT, so this route is intentionally left open. It only removes the
+        local Mongo mirror row (by `shopifyId`); the Shopify-side product is already
+        gone by the time this fires. TODO in source: verify the
+        `X-Shopify-Hmac-Sha256` signature instead of relying on obscurity, once a
+        webhook signing secret is configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: integer, description: Shopify product ID, example: 123456789 }
+      responses:
+        '200':
+          description: Product deleted locally
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: Product deleted locally }
+        '400':
+          description: Shopify product ID missing
+        '500':
+          description: Error processing webhook
+
+  /api/V1/products/{productId}/variant/{variantId}/quantity:
+    put:
+      tags: [Products]
+      summary: Set a variant's inventory quantity (single-location store)
+      description: Requires the `Product Edit` permission. Looks up the variant's `inventory_item_id` and the store's first location, then sets `available` via `inventory_levels/set.json`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: variantId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: number }
+      responses:
+        '200':
+          description: Variant quantity updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Variant quantity updated successfully }
+                  data: { type: object }
+        '400':
+          description: productId, variantId and quantity are required
+        '500':
+          description: Failed to update variant quantity
+
+  /api/V1/products/{productId}/variant/{variantId}/price:
+    put:
+      tags: [Products]
+      summary: Update a variant's price
+      description: Requires the `Product Edit` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: variantId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [price]
+              properties:
+                price: { type: number }
+      responses:
+        '200':
+          description: Variant price updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Variant price updated successfully }
+                  data: { type: object }
+        '400':
+          description: productId, variantId and price are required
+        '500':
+          description: Failed to update variant price
+
+  /api/V1/products/variant/{variantId}/quantity:
+    put:
+      tags: [Products]
+      summary: Set a variant's inventory quantity (path form without productId)
+      description: >
+        Requires the `Product Edit` permission. Identical handler to
+        `/products/{productId}/variant/{variantId}/quantity` — `productId` is unused
+        by the controller, so this shorter path works the same way.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: variantId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: number }
+      responses:
+        '200':
+          description: Variant quantity updated successfully
+        '400':
+          description: productId, variantId and quantity are required
+        '500':
+          description: Failed to update variant quantity
+
+  /api/V1/products/variant/{variantId}/price:
+    put:
+      tags: [Products]
+      summary: Update a variant's price (path form without productId)
+      description: >
+        Requires the `Product Edit` permission. Identical handler to
+        `/products/{productId}/variant/{variantId}/price`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: variantId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [price]
+              properties:
+                price: { type: number }
+      responses:
+        '200':
+          description: Variant price updated successfully
+        '400':
+          description: productId, variantId and price are required
+        '500':
+          description: Failed to update variant price
+
+  /api/V1/products/dashboard/stats:
+    get:
+      tags: [Products]
+      summary: Get admin dashboard statistics
+      description: >
+        Requires the `Dashboard` permission. Aggregates Shopify product/customer
+        counts, local order counts/earnings, recent orders/products, and a
+        `financial_status` distribution (paid/unpaid/pending/refunded) across all
+        non-deleted orders.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Dashboard stats fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      counts:
+                        type: object
+                        properties:
+                          totalOrders: { type: integer }
+                          totalEarnings: { type: number }
+                          totalProducts: { type: integer }
+                          totalCustomers: { type: integer }
+                      recentProducts: { type: array, items: { type: object } }
+                      recentOrders: { type: array, items: { type: object } }
+                      orderStatusDistribution:
+                        type: object
+                        properties:
+                          paid: { type: integer }
+                          unpaid: { type: integer }
+                          pending: { type: integer }
+                          refunded: { type: integer }
+        '500':
+          description: Dashboard API failed
+
+  # --- Collections APIs ---
+  /api/V1/collections:
+    get:
+      tags: [Collections]
+      summary: Get Shopify custom collections
+      description: Requires authentication (no specific permission check beyond a valid bearer token). Proxies `GET /custom_collections.json` from the Shopify Admin REST API.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Categories fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: array, items: { type: object } }
+        '500':
+          description: Failed to fetch Shopify categories
+
+  /api/V1/collections/collection-images:
+    get:
+      tags: [Collections]
+      summary: List collection display images
+      description: Requires the `Collection Image View` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: collectionId
+          in: query
+          required: false
+          schema: { type: string }
+          description: Filter to a single Shopify collection ID.
+      responses:
+        '200':
+          description: Collection images fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id: { type: string }
+                        collectionId: { type: string }
+                        collection_name: { type: string }
+                        image: { type: string, description: Absolute URL to the stored image. }
+                        sortOrder: { type: integer }
+    post:
+      tags: [Collections]
+      summary: Create a collection display image
+      description: Requires the `Collection Image Add` permission. `collectionId` must be unique — a second image for the same collection is rejected with 409.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [collectionId, image]
+              properties:
+                collectionId: { type: string, description: Shopify collection ID. }
+                collection_name: { type: string }
+                image: { type: string, description: Base64-encoded image data (saved to disk via saveBase64Image). }
+      responses:
+        '201':
+          description: Collection image created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '409':
+          description: Collection image already exists for this collection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConflictError'
+
+  /api/V1/collections/collection-images/{id}:
+    get:
+      tags: [Collections]
+      summary: Get a collection display image by ID
+      description: Requires the `Collection Image View` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Collection image fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '404':
+          description: Collection image not found
+    put:
+      tags: [Collections]
+      summary: Update a collection display image
+      description: Requires the `Collection Image Edit` permission. Only replaces the stored file when `image` is a new base64 payload (a value starting with `http` is left as-is).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                collectionId: { type: string }
+                collection_name: { type: string }
+                image: { type: string, description: New base64 image data, or an existing http(s) URL to leave unchanged. }
+      responses:
+        '200':
+          description: Collection image updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '404':
+          description: Collection image not found
+        '409':
+          description: Collection image already exists for this collection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConflictError'
+    delete:
+      tags: [Collections]
+      summary: Delete a collection display image
+      description: Requires the `Collection Image Delete` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Collection image deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '404':
+          description: Collection image not found
+
+  # --- Common APIs ---
+  /api/V1/common/location/all:
+    get:
+      tags: [Common]
+      summary: Get all Shopify locations
+      description: Public endpoint — no authentication required. Proxies `GET /locations.json` from the Shopify Admin REST API.
+      responses:
+        '200':
+          description: Locations fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: Locations fetched successfully }
+                  data: { type: array, items: { type: object } }
+        '500':
+          description: Failed to fetch locations
+
+  # --- Uploads APIs ---
+  /api/V1/upload-base64:
+    post:
+      tags: [Uploads]
+      summary: Upload a base64-encoded image
+      description: Generic file upload used across the admin app (product images, collection images, CMS assets, etc. also have their own inline base64 handling, but this is the shared endpoint). Requires a valid bearer token — no specific permission check.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, description: Base64-encoded image data. }
+                folder: { type: string, default: common, description: Sub-folder under /uploads to store the file in. }
+      responses:
+        '200':
+          description: Uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  path: { type: string, example: /uploads/common/16920001-abc.png }
+        '400':
+          description: Image base64 is required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: false }
+                  message: { type: string, example: Image base64 is required }
+        '500':
+          description: Upload failed
+
+  # --- CMS / Home Layout APIs ---
+  /api/V1/items:
+    post:
+      tags: [CMS / Home Layout]
+      summary: Create a home-screen layout item
+      description: >
+        Requires the `Home Layout Add` permission. `type` identifies the block kind
+        (e.g. `Sliders`, `Banners`, `Collection List`, `Product List`); `data` is a
+        free-form JSON payload whose shape depends on `type` (see `/items/home/details`
+        for how each type is expanded for the mobile app).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, data]
+              properties:
+                type: { type: string, example: "Collection List" }
+                sortOrder: { type: integer }
+                data:
+                  type: object
+                  description: Shape depends on `type` — e.g. `{ collectionIds: [...] }` for "Collection List", `{ items: [{ linkType, id, file }] }` for "Sliders"/"Banners", `{ collectionId }` for "Product List".
+      responses:
+        '201':
+          description: Item created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+    get:
+      tags: [CMS / Home Layout]
+      summary: List all home-screen layout items
+      description: Requires the `Home Layout View` permission. Returned in `sortOrder` ascending order.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Items fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: array, items: { type: object } }
+
+  /api/V1/items/item/{id}:
+    get:
+      tags: [CMS / Home Layout]
+      summary: Get a single home-screen layout item by ID
+      description: Requires the `Home Layout View` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Item fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '404':
+          description: Item not found
+
+  /api/V1/items/{id}:
+    put:
+      tags: [CMS / Home Layout]
+      summary: Update a home-screen layout item
+      description: Requires the `Home Layout Edit` permission. Any of `type`/`sortOrder`/`data` may be omitted to leave that field unchanged.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                type: { type: string }
+                sortOrder: { type: integer }
+                data: { type: object }
+      responses:
+        '200':
+          description: Item updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data: { type: object }
+        '404':
+          description: Item not found
+    delete:
+      tags: [CMS / Home Layout]
+      summary: Delete a home-screen layout item
+      description: Requires the `Home Layout Delete` permission.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Item deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '404':
+          description: Item not found
+
+  /api/V1/items/home/details:
+    get:
+      tags: [CMS / Home Layout]
+      summary: Get the aggregated mobile home-screen payload
+      description: >
+        **Public endpoint — not authenticated.** Consumed by the customer mobile app.
+        Loads all layout items (sorted by `sortOrder`), scans every item's `data` for
+        referenced Shopify collection IDs (from `Collection List.collectionIds`,
+        `Product List.collectionId`, and any `Sliders`/`Banners` entry with
+        `linkType: "Collection"`), then looks up matching `collection-images` records
+        to attach a `collection_name` and a fully-qualified `image` URL to each
+        collection reference. Collection IDs are rewritten to Shopify GIDs
+        (`gid://shopify/Collection/{id}`) in the response, and any relative file
+        paths (slider/banner images) are rewritten to absolute URLs using
+        `BASE_URL_TWO`. Each item's raw `collectionIds` array is replaced by an
+        expanded `collections` array.
+      responses:
+        '200':
+          description: Home layout data fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type: { type: string, example: "Collection List" }
+                        sortOrder: { type: integer }
+                        data:
+                          type: object
+                          description: >
+                            Expanded, type-dependent payload. For "Collection List":
+                            `{ collections: [{ collectionId, collection_name, image }] }`.
+                            For "Product List": `{ collectionId: "gid://shopify/Collection/..." , ... }`.
+                            For "Sliders"/"Banners": `{ items: [{ ..., id, file }] }`
+                            with `id` rewritten to a collection GID when `linkType` is
+                            "Collection", and `file` rewritten to an absolute URL.
+              example:
+                status: success
+                data:
+                  - type: "Collection List"
+                    sortOrder: 1
+                    data:
+                      collections:
+                        - collectionId: "gid://shopify/Collection/123456"
+                          collection_name: "Fresh Produce"
+                          image: "https://example.com/uploads/collection-images/abc.png"
+
+  # --- Profile APIs ---
+  /api/V1/profile:
+    get:
+      tags: [Profile]
+      summary: Get the current user's own profile
+      description: Requires a valid bearer token. Populates `role` (excluding its `permissions` list and `__v`); excludes `password`, `refreshToken`, `__v` from the user document.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Profile fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      _id: { type: string }
+                      name: { type: string }
+                      email: { type: string }
+                      role: { type: object }
+        '404':
+          description: User not found
+
+  /api/V1/profile/changepassword:
+    put:
+      tags: [Profile]
+      summary: Change the current user's own password
+      description: Requires a valid bearer token. Rejects if `current_password` doesn't match, or if `new_password` is identical to the existing password.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 6 }
+      responses:
+        '200':
+          description: Password changed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '404':
+          description: User not found
+        '500':
+          description: >
+            Current password is incorrect, or new password matches the existing one.
+            Note: these validation failures are raised via `InternalServerError` in
+            this controller, so they surface as HTTP 500 rather than 400/409.
+
   # --- Orders Management APIs ---
   /api/V1/orders:
     get:
       tags: [Orders]
       summary: Get all orders
+      description: >
+        Requires the `Order List` permission. Supports search, financial-status,
+        date-range, assignment-status and derived order-status filtering, plus
+        multi-field sorting via `sortBy=field:asc,field2:desc`.
       security: [{ bearerAuth: [] }]
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 0 }
+          description: Zero-based page index (unlike most other list endpoints in this API, which are 1-based).
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Matches order_number, customer firstname, or customer lastname (case-insensitive).
+        - name: financial_status
+          in: query
+          schema: { type: string, example: paid }
+        - name: sortBy
+          in: query
+          schema: { type: string, example: "createdAt:desc" }
+        - name: from_date
+          in: query
+          schema: { type: string, format: date }
+        - name: to_date
+          in: query
+          schema: { type: string, format: date }
+        - name: assigned_status
+          in: query
+          schema: { type: string, enum: [assigned, unassigned] }
+        - name: order_status
+          in: query
+          schema: { type: string, enum: [Pickup, Delivered, Pending, Cancelled] }
+          description: Maps to fulfillment_status/cancelled_at under the hood (e.g. Pickup -> fulfillment_status=scheduled).
       responses:
-        '200': { description: Success }
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  page: { type: integer }
+                  limit: { type: integer }
+                  total: { type: integer }
+                  totalPages: { type: integer }
+                  data: { type: array, items: { type: object } }
+
+    post:
+      tags: [Orders]
+      summary: Shopify order create/update webhook receiver
+      description: >
+        **Public endpoint — not authenticated.** Doubles as the Shopify
+        `orders/create` and `orders/updated` webhook target and an internal
+        upsert entry point: if an order with the given `id`/`order_id` already
+        exists it is refreshed (financial/fulfillment status, currency, delivery
+        amount, line items); otherwise a new local Order document is created and
+        an `OrderTimeline` "created" entry is logged. Enriches each line item with
+        Shopify product image + vendor metafields, and cross-references the order's
+        Shopify fulfillment order to attach `fulfillment_item_id` per line.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw Shopify Order payload (subset of fields the handler reads shown below).
+              properties:
+                id: { type: integer, description: Shopify order ID. }
+                order_id: { type: integer, description: Alternate field name accepted in place of `id`. }
+                email: { type: string }
+                name: { type: string }
+                order_number: { type: string }
+                phone: { type: string }
+                currency: { type: string }
+                financial_status: { type: string }
+                fulfillment_status: { type: string, nullable: true }
+                total_discounts: { type: number }
+                total_price: { type: number }
+                total_tax: { type: number }
+                subtotal_price: { type: number }
+                payment_gateway_names: { type: array, items: { type: string } }
+                shipping_lines: { type: array, items: { type: object } }
+                total_shipping_price_set: { type: object }
+                shipping_address: { type: object }
+                customer: { type: object }
+                created_at: { type: string, format: date-time }
+                line_items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id: { type: integer }
+                      name: { type: string }
+                      price: { type: string }
+                      product_id: { type: integer }
+                      variant_id: { type: integer }
+                      sku: { type: string }
+                      title: { type: string }
+                      quantity: { type: integer }
+                      vendor: { type: string }
+                      total_discount: { type: string }
+                      fulfillment_status: { type: string, nullable: true }
+      responses:
+        '200':
+          description: New order created, or existing order updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: New order created }
+                  data: { type: object }
+
+  /api/V1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get orders for a given vendor (paginated)
+      description: >
+        Requires the `Order List` permission. Despite the generic `{id}` path
+        parameter name, this fetches orders scoped to a vendor ID/name (delegates
+        to the `getVendorOrders` helper) — it is not a get-by-order-id endpoint;
+        that is `/orders/all/{id}`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Vendor identifier.
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+      responses:
+        '200':
+          description: Orders fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: orders fetched successfully }
+                  data: { type: object }
+
+  /api/V1/orders/all/{id}:
+    get:
+      tags: [Orders]
+      summary: Get full order detail by Mongo order ID
+      description: >
+        Requires the `Order Details` permission. Looks up the order by its Mongo
+        `_id` (not the Shopify order_id), populates the assigned delivery agent,
+        and attaches `removed_line_items` and its `OrderTimeline` history.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Mongo ObjectId of the order.
+      responses:
+        '200':
+          description: Order details fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Order details fetched successfully }
+                  data:
+                    type: object
+                    properties:
+                      removed_line_items: { type: array, items: { type: object } }
+                      timeline: { type: array, items: { type: object } }
+        '404':
+          description: Order not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: error }
+                  message: { type: string, example: Order not found }
+
+  /api/V1/orders/update:
+    post:
+      tags: [Orders]
+      summary: Apply a Shopify order-edit (add/remove/adjust line items) to an order
+      description: >
+        Requires the `Order fulfill` permission. Delegates the actual Shopify
+        `orderEditBegin`/`orderEditCommit` GraphQL flow to the `handleOrderEdit`
+        helper, records who made the change (`modified_by`) on the local order,
+        and logs an `OrderTimeline` "updated" entry.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_edit]
+              properties:
+                order_edit:
+                  type: object
+                  description: Shopify order-edit instructions, keyed by `order_id`.
+                  properties:
+                    order_id: { type: string, description: Shopify order ID (matched against Order.order_id). }
+      responses:
+        '200':
+          description: Order updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /api/V1/orders/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel an order
+      description: >
+        Requires the `Order fulfill` permission. Sets `cancelled_at`,
+        `cancel_reason`, `financial_status`, marks every line item's
+        `deleted_date`, and records `modified_by`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: Shopify order ID (matched against Order.order_id). }
+                cancelled_at: { type: string, format: date-time }
+                cancel_reason: { type: string }
+                financial_status: { type: string }
+      responses:
+        '200':
+          description: >
+            No response body is sent by this handler — the request resolves with an
+            empty 200 body once the order is saved. (Documented as observed in the
+            controller; every sibling order-mutation endpoint returns a JSON status
+            envelope, so this looks like a missed `res.json(...)` call rather than
+            intentional behavior.)
+
+  /api/V1/orders/fulfilled:
+    post:
+      tags: [Orders]
+      summary: Fulfill all not-yet-fulfilled line items on an order (Shopify fulfillmentCreateV2)
+      description: >
+        Requires the `Order fulfill` permission. Filters `line_items` down to those
+        without an existing `fulfillment_status`, then issues one Shopify
+        `fulfillmentCreateV2` GraphQL mutation covering all of them against the
+        given `fulfillment_id`. On success, marks the whole local order + every
+        line item as `Fulfilled`/`Delivered`. If the order has no `assigned_agent`
+        yet, auto-assigns it to the calling user.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, fulfillment_id, line_items]
+              properties:
+                order_id: { type: string, description: Shopify order ID (matched against Order.order_id). }
+                fulfillment_id: { type: string, description: Shopify FulfillmentOrder numeric ID. }
+                line_items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      fulfillment_item_id: { type: string }
+                      quantity: { type: integer }
+                      fulfillment_status: { type: string, nullable: true, description: Items that already have a status here are skipped. }
+      responses:
+        '201':
+          description: Fulfillment successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Fulfillment successful }
+                  data: { type: object }
+        '500':
+          description: Fulfillment failed, or the requested quantity is not available (Shopify userErrors)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: failed }
+                  message: { type: string }
+
+  /api/V1/orders/fulfillSingleItem:
+    post:
+      tags: [Orders]
+      summary: Fulfill a single line item on an order (Shopify fulfillmentCreateV2)
+      description: >
+        Requires the `Order fulfill` permission. Marks just the given line item
+        `Fulfilled` locally (and the whole order `Fulfilled` if that was the last
+        unfulfilled item). If the order has no `assigned_agent` yet, auto-assigns
+        it to the calling user.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fulfillment_id, fulfillment_item_id, quantity, order_id]
+              properties:
+                fulfillment_id: { type: string, description: Shopify FulfillmentOrder numeric ID. }
+                fulfillment_item_id: { type: string, description: Shopify FulfillmentOrderLineItem numeric ID. }
+                quantity: { type: integer }
+                order_id: { type: string, description: Shopify order ID (matched against Order.order_id). }
+                title: { type: string, description: Used only in the OrderTimeline log message. }
+      responses:
+        '201':
+          description: Line item fulfilled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Line item fulfilled successfully }
+                  data: { type: object }
+        '400':
+          description: Missing required parameters (fulfillment_id, fulfillment_item_id, quantity)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: fail }
+                  message: { type: string }
+        '500':
+          description: Failed to fulfill line item (includes Shopify userErrors)
+
+  /api/V1/orders/pickup:
+    post:
+      tags: [Orders]
+      summary: Mark an order as picked up
+      description: >
+        Requires the `Order fulfill` permission. Sets `fulfillment_status` to
+        `scheduled` and `delivery_status` to `Picked Up`, stamps `picked_up_at`.
+        Auto-assigns the order to the calling user if it has no `assigned_agent`
+        yet. Response shape matches `/orders/all/{id}` for frontend consistency.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                order_id: { type: string, description: Shopify order ID; either this or `id` is required. }
+                id: { type: string, description: Alternate field name accepted in place of order_id. }
+      responses:
+        '200':
+          description: Order marked as Picked Up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Order marked as Picked Up }
+                  data:
+                    type: object
+                    properties:
+                      timeline: { type: array, items: { type: object } }
+        '404':
+          description: Order not found
+
+  /api/V1/orders/delete:
+    post:
+      tags: [Orders]
+      summary: Soft-delete an order
+      description: Requires the `Order Delete` permission. Sets `deleted_at` on the order; does not remove the document.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: Shopify order ID (matched against Order.order_id). }
+      responses:
+        '200':
+          description: Order deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: Order deleted successfully }
+                  data:
+                    type: object
+                    properties:
+                      order_id: { type: string }
+                      deleted_at: { type: string, format: date-time }
+        '404':
+          description: order not found

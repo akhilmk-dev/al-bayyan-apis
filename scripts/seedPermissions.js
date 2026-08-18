@@ -60,6 +60,10 @@ const PERMISSION_CATALOGUE = [
   { permission_name: 'Collection Image Add', page_url: '/collectionImageUpload', group: 'Mobile' },
   { permission_name: 'Collection Image Edit', page_url: '/collectionImageUpload', group: 'Mobile' },
   { permission_name: 'Collection Image Delete', page_url: '/collectionImageUpload', group: 'Mobile' },
+
+  // Settings
+  { permission_name: 'Settings View', page_url: '/settings', group: 'Settings' },
+  { permission_name: 'Settings Update', page_url: '/settings', group: 'Settings' },
 ];
 
 const ADMIN_ROLE_NAME = 'Admin';

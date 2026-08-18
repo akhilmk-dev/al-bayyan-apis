@@ -8,6 +8,7 @@ const { NotFoundError } = require('../utils/customErrors');
 const RemovedLineItem = require('../models/RemovedLineItem');
 const OrderTimeline = require('../models/OrderTimeline');
 const User = require('../models/User');
+const { geocodeAddress } = require('../utils/geocodeClient');
 
 // get all orders
 exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
@@ -68,6 +69,41 @@ exports.getOrderDetailByCustomer = catchAsync(async (req, res, next) => {
          ...order,
          removed_line_items: removedItems,
          timeline,
+      }
+   });
+});
+
+// Live order tracking for the external customer app. Auth is a shared static
+// API key (see middleware/trackingAuthMiddleware.js), not JWT - the caller
+// has no account in this system, just the key.
+exports.getOrderTracking = catchAsync(async (req, res, next) => {
+   const { orderId } = req.params;
+
+   const order = await Order.findOne({ order_id: orderId })
+      .populate('assigned_agent')
+      .select('order_id delivery_status shipping_address current_location assigned_agent agent_type')
+      .lean();
+
+   if (!order) {
+      return next(new NotFoundError("Order not found"));
+   }
+
+   res.status(200).json({
+      status: "success",
+      data: {
+         order_id: order.order_id,
+         delivery_status: order.delivery_status,
+         destination: {
+            latitude: order.shipping_address?.latitude ?? null,
+            longitude: order.shipping_address?.longitude ?? null,
+         },
+         current_location: order.current_location?.latitude != null ? order.current_location : null,
+         agent: order.assigned_agent
+            ? {
+               name: order.assigned_agent.name,
+               vehicle_type: order.assigned_agent.vehicle_type ?? null,
+            }
+            : null,
       }
    });
 });
@@ -248,10 +284,32 @@ exports.createOrder = catchAsync(async (req, res, next) => {
       orderExists.currency = order.currency;
       orderExists.delivery_amount = Number(order.shipping_lines?.[0]?.price || order.total_shipping_price_set?.shop_money?.amount || 0);
       orderExists.line_items = consolidatedLineItems; // Refresh line items with new data/images
-      
+
+      // Backfill geocoding only if it's still unset - avoids re-geocoding on
+      // every webhook update (the address doesn't change after placement in
+      // the common case) while self-healing an order whose initial geocode
+      // attempt failed (bad key, transient error, quota hit).
+      if (orderExists.shipping_address?.latitude == null) {
+         const geocoded = await geocodeAddress(orderExists.shipping_address);
+         if (geocoded) {
+            orderExists.shipping_address.latitude = geocoded.latitude;
+            orderExists.shipping_address.longitude = geocoded.longitude;
+         }
+      }
+
       const data = await orderExists.save();
       return res.status(200).json({ status: "success", message: "order updated successfully", data });
    }
+
+   // Geocode the shipping address into destination coordinates for live
+   // tracking. Fails silently (see utils/geocodeClient.js) - never blocks
+   // order creation.
+   const geocoded = await geocodeAddress(order.shipping_address);
+   const shippingAddressWithCoords = {
+      ...(order.shipping_address || {}),
+      latitude: geocoded?.latitude ?? null,
+      longitude: geocoded?.longitude ?? null,
+   };
 
    // Create new order
    const newOrder = new Order({
@@ -274,7 +332,7 @@ exports.createOrder = catchAsync(async (req, res, next) => {
       total_tax: order.total_tax || 0,
       subtotal_price: order.subtotal_price || 0,
       delivery_amount: Number(order.shipping_lines?.[0]?.price || order.total_shipping_price_set?.shop_money?.amount || 0),
-      shipping_address: order.shipping_address || {},
+      shipping_address: shippingAddressWithCoords,
       customer: order.customer || {},
       line_items: consolidatedLineItems
    });
@@ -328,9 +386,11 @@ exports.updateOrder = catchAsync(async (req, res, next) => {
 exports.cancelOrder = catchAsync(async (req, res, next) => {
    const orderCancelPayload = req.body;
    const order = await Order.findOne({ order_id: orderCancelPayload.id });
+   if (!order) throw new NotFoundError("Order not found");
+
    const user = await User.findById(req.user.id);
 
-   order.cancelled_at = orderCancelPayload?.cancelled_at;
+   order.cancelled_at = orderCancelPayload?.cancelled_at || new Date();
    order.cancel_reason = orderCancelPayload?.cancel_reason;
    order.financial_status = orderCancelPayload?.financial_status;
    order.modified_by = req.user.id; // Track modification
@@ -339,7 +399,26 @@ exports.cancelOrder = catchAsync(async (req, res, next) => {
       ...item,
       deleted_date: now
    }));
-   const data = await order.save();
+   order.current_location = undefined;
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'cancelled',
+      message: `Order cancelled by ${user?.name || 'Admin'}${order.cancel_reason ? ` (${order.cancel_reason})` : ''}`
+   });
+
+   const updatedOrder = await Order.findOne({ order_id: order.order_id }).populate('assigned_agent').lean();
+   const timeline = await OrderTimeline.find({ order_id: order.order_id }).sort({ created_at: -1 });
+
+   res.status(200).json({
+      status: "success",
+      message: "Order cancelled",
+      data: {
+         ...updatedOrder,
+         timeline
+      }
+   });
 })
 
 exports.getOrderById = catchAsync(async (req, res, next) => {
@@ -445,6 +524,8 @@ exports.fulfilOrder = catchAsync(async (req, res, next) => {
          order.agent_type = 'User';
          order.assignment_date = new Date();
       }
+
+      order.current_location = undefined;
 
       const data = await order.save();
       await OrderTimeline.create({
