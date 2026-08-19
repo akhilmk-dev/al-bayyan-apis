@@ -93,6 +93,10 @@ const orderSchema = new mongoose.Schema({
   }],
   picked_up_at: { type: Date, default: null },
   delivered_at: { type: Date, default: null },
+  // OTP verification required before an agent can mark an order Delivered -
+  // generated and emailed to the customer when the agent requests it.
+  delivery_otp: { type: String, default: null },
+  delivery_otp_expiry: { type: Date, default: null },
   current_location: {
     latitude: { type: Number, default: null },
     longitude: { type: Number, default: null },

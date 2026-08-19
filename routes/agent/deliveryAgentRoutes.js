@@ -7,6 +7,7 @@ const notificationController = require('../../controllers/notificationController
 const validateMiddleware = require('../../utils/validate');
 const { locationSchema } = require('../../validations/locationValidation');
 const { rejectOrderSchema } = require('../../validations/rejectOrderValidation');
+const { verifyDeliveryOtpSchema } = require('../../validations/deliveryOtpValidation');
 
 router.post('/login', deliveryAgentController.loginAgent);
 router.post('/refresh-token', deliveryAgentController.refreshToken);
@@ -22,6 +23,8 @@ router.get('/order-detail/:id', authenticate, deliveryAgentController.getOrderDe
 router.put('/update-delivery-status/:id', authenticate, deliveryAgentController.updateDeliveryStatus);
 router.put('/orders/:id/accept', authenticate, deliveryAgentController.acceptOrder);
 router.put('/orders/:id/reject', authenticate, validateMiddleware(rejectOrderSchema), deliveryAgentController.rejectOrder);
+router.post('/orders/:id/request-delivery-otp', authenticate, deliveryAgentController.requestDeliveryOtp);
+router.put('/orders/:id/verify-delivery-otp', authenticate, validateMiddleware(verifyDeliveryOtpSchema), deliveryAgentController.verifyDeliveryOtp);
 router.put('/update-location/:id', authenticate, validateMiddleware(locationSchema), deliveryAgentController.updateLiveLocation);
 router.put('/update-profile', authenticate, uploadAgentAvatar.single('avatar'), deliveryAgentController.updateProfile);
 router.put('/change-password', authenticate, deliveryAgentController.changePasswordAgent);

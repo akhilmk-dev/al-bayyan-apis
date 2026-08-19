@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const getFullUrl = require('../utils/fullUrl');
 const sendNotification = require('../utils/sendNotification');
+const { sendEmail } = require('../utils/emailClient');
 const axios = require('axios');
 
 // --- Admin Controllers ---
@@ -573,99 +574,23 @@ exports.updateDeliveryStatus = catchAsync(async (req, res, next) => {
         });
     }
 
+    // Marking Delivered now requires OTP verification - see requestDeliveryOtp
+    // / verifyDeliveryOtp below. This endpoint only handles Picked Up/Cancelled.
+    if (status === 'Delivered') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Use the delivery OTP flow (request-delivery-otp / verify-delivery-otp) to mark an order as Delivered'
+        });
+    }
+
     order.delivery_status = status; // Keeping for backward compatibility but focusing on fulfillment_status
     if (status === 'Picked Up') {
         order.picked_up_at = new Date();
         order.fulfillment_status = 'scheduled';
     }
-    if (status === 'Delivered') {
-        order.delivered_at = new Date();
-        order.fulfillment_status = 'fulfilled';
-
-        // SYNC TO SHOPIFY: Create Fulfillment
-        if (order.fulfillment_id) {
-            try {
-                const mutation = `
-                    mutation FulfillOrder {
-                        fulfillmentCreateV2(fulfillment: {
-                            notifyCustomer: true,
-                            lineItemsByFulfillmentOrder: [
-                                {
-                                    fulfillmentOrderId: "gid://shopify/FulfillmentOrder/${order.fulfillment_id}"
-                                }
-                            ]
-                        }) {
-                            fulfillment { id status }
-                            userErrors { message }
-                        }
-                    }
-                `;
-                const shopifyRes = await axios.post(process.env.SHOPIFY_ADMIN_API, { query: mutation }, {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN
-                    }
-                });
-
-                if (shopifyRes.data?.data?.fulfillmentCreateV2?.userErrors?.length > 0) {
-                    console.error("Shopify Sync Errors (Delivered):", shopifyRes.data.data.fulfillmentCreateV2.userErrors);
-                } else if (shopifyRes.data?.errors) {
-                    console.error("Shopify Sync API Errors (Delivered):", shopifyRes.data.errors);
-                } else {
-                    console.log(`Order ${order.order_id} fulfilled in Shopify successfully.`);
-                }
-            } catch (err) {
-                console.error("Shopify Sync Exception (Delivered):", err.response?.data || err.message);
-            }
-        } else {
-            console.warn(`Order ${order.order_id} has no fulfillment_id. Cannot sync to Shopify.`);
-        }
-
-        // Credit delivery earnings. Only real DeliveryAgent assignees earn — a
-        // dashboard User who self-assigned via pickupOrder should not. Fails
-        // silently/logs, same as the Shopify sync above, so a ledger-write
-        // hiccup never blocks the delivery-status update itself.
-        if (order.agent_type === 'DeliveryAgent') {
-            try {
-                const settings = await Settings.getSingleton();
-                const rate = settings.delivery_earning_rate;
-
-                await AgentEarning.create({
-                    agent_id: order.assigned_agent,
-                    order_id: order._id,
-                    amount: rate,
-                    delivered_at: order.delivered_at,
-                });
-
-                const earningTitle = 'Delivery Completed 💰';
-                const earningMessage = `You earned ${rate} for this delivery.`;
-                const earningData = { id: order._id.toString(), order_id: order.order_id, type: 'earning_credited' };
-
-                await sendNotification(
-                    order.assigned_agent,
-                    earningTitle,
-                    earningMessage,
-                    earningData,
-                    `com.albayyan_staffapp://OrderDetail/${order._id.toString()}`
-                );
-
-                await Notification.create({
-                    agent_id: order.assigned_agent,
-                    title: earningTitle,
-                    message: earningMessage,
-                    data: earningData,
-                    is_read: false
-                });
-            } catch (err) {
-                console.error('Earnings crediting failed:', err);
-            }
-        }
-    }
-    if (status === 'Cancelled') order.cancelled_at = new Date();
-
-    // Live-tracking data is ephemeral - clear it once the order is no longer
-    // in transit, whichever terminal state it reaches.
-    if (status === 'Delivered' || status === 'Cancelled') {
+    if (status === 'Cancelled') {
+        order.cancelled_at = new Date();
+        // Live-tracking data is ephemeral - clear it once no longer in transit.
         order.current_location = undefined;
     }
 
@@ -674,12 +599,184 @@ exports.updateDeliveryStatus = catchAsync(async (req, res, next) => {
     // Create timeline entry
     await OrderTimeline.create({
         order_id: order.order_id,
-        action: status === 'Picked Up' ? 'Picked Up' : (status === 'Delivered' ? 'Delivered' : status),
-        message: `Order status updated to ${status} (Synced to Shopify)`
+        action: status === 'Picked Up' ? 'Picked Up' : status,
+        message: `Order status updated to ${status}`
     });
 
-
     res.status(200).json({ status: 'success', message: `Order status updated to ${status}`, data: order });
+});
+
+// Shared logic for actually completing a delivery - called once the delivery
+// OTP has been verified. Mirrors what updateDeliveryStatus used to do inline
+// for status === 'Delivered' (Shopify fulfillment sync, earnings crediting,
+// live-location cleanup), extracted so it isn't duplicated across call sites.
+const completeDelivery = async (order) => {
+    order.delivery_status = 'Delivered';
+    order.delivered_at = new Date();
+    order.fulfillment_status = 'fulfilled';
+
+    // SYNC TO SHOPIFY: Create Fulfillment
+    if (order.fulfillment_id) {
+        try {
+            const mutation = `
+                mutation FulfillOrder {
+                    fulfillmentCreateV2(fulfillment: {
+                        notifyCustomer: true,
+                        lineItemsByFulfillmentOrder: [
+                            {
+                                fulfillmentOrderId: "gid://shopify/FulfillmentOrder/${order.fulfillment_id}"
+                            }
+                        ]
+                    }) {
+                        fulfillment { id status }
+                        userErrors { message }
+                    }
+                }
+            `;
+            const shopifyRes = await axios.post(process.env.SHOPIFY_ADMIN_API, { query: mutation }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN
+                }
+            });
+
+            if (shopifyRes.data?.data?.fulfillmentCreateV2?.userErrors?.length > 0) {
+                console.error("Shopify Sync Errors (Delivered):", shopifyRes.data.data.fulfillmentCreateV2.userErrors);
+            } else if (shopifyRes.data?.errors) {
+                console.error("Shopify Sync API Errors (Delivered):", shopifyRes.data.errors);
+            } else {
+                console.log(`Order ${order.order_id} fulfilled in Shopify successfully.`);
+            }
+        } catch (err) {
+            console.error("Shopify Sync Exception (Delivered):", err.response?.data || err.message);
+        }
+    } else {
+        console.warn(`Order ${order.order_id} has no fulfillment_id. Cannot sync to Shopify.`);
+    }
+
+    // Credit delivery earnings. Only real DeliveryAgent assignees earn — a
+    // dashboard User who self-assigned via pickupOrder should not. Fails
+    // silently/logs, same as the Shopify sync above, so a ledger-write
+    // hiccup never blocks the delivery-status update itself.
+    if (order.agent_type === 'DeliveryAgent') {
+        try {
+            const settings = await Settings.getSingleton();
+            const rate = settings.delivery_earning_rate;
+
+            await AgentEarning.create({
+                agent_id: order.assigned_agent,
+                order_id: order._id,
+                amount: rate,
+                delivered_at: order.delivered_at,
+            });
+
+            const earningTitle = 'Delivery Completed 💰';
+            const earningMessage = `You earned ${rate} for this delivery.`;
+            const earningData = { id: order._id.toString(), order_id: order.order_id, type: 'earning_credited' };
+
+            await sendNotification(
+                order.assigned_agent,
+                earningTitle,
+                earningMessage,
+                earningData,
+                `com.albayyan_staffapp://OrderDetail/${order._id.toString()}`
+            );
+
+            await Notification.create({
+                agent_id: order.assigned_agent,
+                title: earningTitle,
+                message: earningMessage,
+                data: earningData,
+                is_read: false
+            });
+        } catch (err) {
+            console.error('Earnings crediting failed:', err);
+        }
+    }
+
+    // Live-tracking + OTP data is ephemeral - clear it once delivered.
+    order.current_location = undefined;
+    order.delivery_otp = null;
+    order.delivery_otp_expiry = null;
+
+    await order.save();
+
+    await OrderTimeline.create({
+        order_id: order.order_id,
+        action: 'Delivered',
+        message: 'Order marked as Delivered (OTP verified)'
+    });
+};
+
+// Agent taps "Mark as Delivered" - generates an OTP and emails it to the
+// customer. Order stays Picked Up until the OTP is verified.
+exports.requestDeliveryOtp = catchAsync(async (req, res, next) => {
+    const order = await Order.findById(req.params.id);
+    if (!order) throw new NotFoundError('Order not found');
+
+    if (!order.assigned_agent || order.assigned_agent.toString() !== req.user.id) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Access denied: You are not assigned to this order or the order is unassigned'
+        });
+    }
+    if (order.delivery_status !== 'Picked Up') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Order must be Picked Up before requesting a delivery OTP'
+        });
+    }
+
+    // Dummy fixed OTP for now, per requirement - swap for a real random
+    // generator once Brevo is fully configured for production use.
+    const otp = '5555';
+    order.delivery_otp = otp;
+    order.delivery_otp_expiry = new Date(Date.now() + 60 * 1000); // 1 minute
+    await order.save();
+
+    const customerEmail = order.email || order.customer?.email;
+    await sendEmail({
+        to: customerEmail,
+        toName: order.customer?.first_name,
+        subject: `Your delivery confirmation code for order ${order.name || order.order_id}`,
+        htmlContent: `<p>Your OTP to confirm delivery of order <strong>${order.name || order.order_id}</strong> is <strong>${otp}</strong>. It is valid for 1 minute.</p>`,
+    });
+
+    res.status(200).json({ status: 'success', message: `OTP sent to customer (Default: ${otp})` });
+});
+
+// Agent enters the OTP the customer gives them. If correct, the delivery is
+// actually completed - this is the only place status can become Delivered.
+exports.verifyDeliveryOtp = catchAsync(async (req, res, next) => {
+    const { otp } = req.body;
+    const order = await Order.findById(req.params.id);
+    if (!order) throw new NotFoundError('Order not found');
+
+    if (!order.assigned_agent || order.assigned_agent.toString() !== req.user.id) {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Access denied: You are not assigned to this order or the order is unassigned'
+        });
+    }
+    if (order.delivery_status !== 'Picked Up') {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Order is not awaiting delivery confirmation'
+        });
+    }
+    if (!order.delivery_otp || !order.delivery_otp_expiry || order.delivery_otp_expiry < new Date()) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'OTP expired or not requested. Please request a new OTP.'
+        });
+    }
+    if (otp !== order.delivery_otp) {
+        return res.status(400).json({ status: 'error', message: 'Incorrect OTP' });
+    }
+
+    await completeDelivery(order);
+
+    res.status(200).json({ status: 'success', message: 'Order marked as Delivered', data: order });
 });
 
 // Update Live Location (agent app pings this every 10-15s while delivering)

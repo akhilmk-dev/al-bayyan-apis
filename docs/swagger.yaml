@@ -565,7 +565,7 @@ paths:
     put:
       tags:
         - Delivery Agent (App)
-      summary: Update the delivery status (Picked Up / Delivered / Cancelled)
+      summary: Update the delivery status (Picked Up / Cancelled only - Delivered requires the OTP flow below)
       security:
         - bearerAuth: []
       parameters:
@@ -581,7 +581,7 @@ paths:
               type: object
               required: [status]
               properties:
-                status: { type: string, enum: ['Picked Up', 'Delivered', 'Cancelled'] }
+                status: { type: string, enum: ['Picked Up', 'Cancelled'], description: "'Delivered' is rejected here with a 400 - use request-delivery-otp / verify-delivery-otp instead" }
       responses:
         '200':
           description: Delivery status updated successfully
@@ -593,6 +593,74 @@ paths:
                   status: { type: string, example: success }
                   message: { type: string }
                   data: { type: object }
+
+  /api/V1/agent/delivery-agent/orders/{id}/request-delivery-otp:
+    post:
+      tags:
+        - Delivery Agent (App)
+      summary: Request a delivery OTP (agent taps "Mark as Delivered") - emails the customer, order stays Picked Up
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OTP generated and emailed to the customer
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: "OTP sent to customer (Default: 5555)" }
+        '400':
+          description: Order is not currently Picked Up
+        '403':
+          description: Not assigned to this order
+        '404':
+          description: Order not found
+
+  /api/V1/agent/delivery-agent/orders/{id}/verify-delivery-otp:
+    put:
+      tags:
+        - Delivery Agent (App)
+      summary: Verify the delivery OTP - only this actually marks the order Delivered
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otp]
+              properties:
+                otp: { type: string, example: "5555" }
+      responses:
+        '200':
+          description: Order marked as Delivered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string }
+                  data: { type: object }
+        '400':
+          description: Incorrect/expired/missing OTP, or order not awaiting delivery confirmation
+        '403':
+          description: Not assigned to this order
+        '404':
+          description: Order not found
 
   /api/V1/agent/delivery-agent/update-location/{id}:
     put:
