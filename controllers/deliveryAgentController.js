@@ -435,8 +435,15 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
 exports.getDeliveryStats = catchAsync(async (req, res, next) => {
     const agentId = req.user.id;
 
-    const pending_count = await Order.countDocuments({ assigned_agent: agentId, delivery_status: 'Pending' });
     const delivered_count = await Order.countDocuments({ assigned_agent: agentId, delivery_status: 'Delivered' });
+
+    // Orders assigned to this agent still awaiting an accept/reject decision.
+    // (assignment_status is null for orders assigned before that field existed.)
+    const pending_orders = await Order.find({
+        assigned_agent: agentId,
+        delivery_status: 'Pending'
+    }).sort({ assignment_date: -1 });
+    const pending_count = pending_orders.length;
 
     // Any order that is currently "Picked Up" by this agent
     const current_order = await Order.findOne({
@@ -457,6 +464,7 @@ exports.getDeliveryStats = catchAsync(async (req, res, next) => {
         data: {
             pending_count,
             delivered_count,
+            pending_orders,
             current_order: current_order || null,
             recent_activity
         }

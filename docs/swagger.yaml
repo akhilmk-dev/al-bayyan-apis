@@ -484,6 +484,11 @@ paths:
                     properties:
                       pending_count: { type: integer }
                       delivered_count: { type: integer }
+                      pending_orders:
+                        type: array
+                        description: Full order objects assigned to this agent still awaiting accept/reject
+                        items:
+                          type: object
                       current_order: { type: object, nullable: true }
                       recent_activity:
                         type: array
