@@ -908,6 +908,13 @@ paths:
       tags:
         - Customer App
       summary: Get detailed information for a specific order of a customer
+      description: >
+        Includes return/refund status for the mobile app: `return_status` is
+        the most recent entry in `returns[]` (`REQUESTED` | `OPEN` | `DECLINED`
+        | `CANCELED` | `CLOSED`, or `null` if no return exists), `is_refunded`
+        is `true` once `total_refunded` is greater than 0. The full `returns[]`
+        and `refunds[]` arrays are also present if more detail is needed
+        (reasons, line items, amounts per refund).
       parameters:
         - name: customerId
           in: path
@@ -931,7 +938,14 @@ paths:
                 properties:
                   status: { type: string, example: success }
                   message: { type: string }
-                  data: { type: object }
+                  data:
+                    type: object
+                    properties:
+                      return_status: { type: string, nullable: true, enum: [REQUESTED, OPEN, DECLINED, CANCELED, CLOSED, null] }
+                      is_refunded: { type: boolean }
+                      total_refunded: { type: number }
+                      returns: { type: array, items: { type: object } }
+                      refunds: { type: array, items: { type: object } }
         '404':
           description: Order not found
 

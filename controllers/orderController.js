@@ -15,6 +15,18 @@ const { ORDER_FULFILLMENT_LINE_ITEMS_QUERY, SUGGESTED_REFUND_QUERY } = require('
 const notifyCustomerStatus = require('../utils/notifyCustomerStatus');
 
 // get all orders
+// Simple top-level fields for the mobile app, on top of the full `returns`/
+// `refunds` arrays already present on every order document - saves the
+// mobile app from having to parse those arrays itself for the common case
+// of "does this order have a return, what's it doing, has it been refunded".
+const withReturnRefundSummary = (order) => ({
+   ...order,
+   return_status: order.returns?.length
+      ? order.returns[order.returns.length - 1].status
+      : null,
+   is_refunded: (order.total_refunded || 0) > 0
+});
+
 exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
    const customerId = Number(req.params.customerId);
    if (isNaN(customerId)) {
@@ -42,7 +54,7 @@ exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
       limit,
       totalPages: Math.ceil(total / limit),
       results: orders.length,
-      data: orders,
+      data: orders.map(withReturnRefundSummary),
    });
 });
 
@@ -70,7 +82,7 @@ exports.getOrderDetailByCustomer = catchAsync(async (req, res, next) => {
       status: "success",
       message: "Order details fetched successfully",
       data: {
-         ...order,
+         ...withReturnRefundSummary(order),
          removed_line_items: removedItems,
          timeline,
       }
