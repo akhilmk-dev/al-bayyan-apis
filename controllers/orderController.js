@@ -87,6 +87,24 @@ exports.getOrderDetailByCustomer = catchAsync(async (req, res, next) => {
 // approval in Shopify admin) rather than returnCreate (auto-open) - the
 // returns/request|approve|decline|close webhooks below keep the local
 // status in sync as the merchant processes it.
+//
+// Shared guard for both return-request endpoints below: can't return
+// something that hasn't reached the customer yet (same style as the
+// cancel-after-pickup restriction on cancelOrder), and only one return at a
+// time per order - REQUESTED/OPEN is still in progress, CLOSED means it
+// already went through (refunded), so a fresh request would just re-return
+// already-refunded items. DECLINED/CANCELED leave the door open again since
+// nothing was actually returned.
+const getReturnBlockReason = (order) => {
+   if (order.delivery_status !== 'Delivered') {
+      return `A return can only be requested once the order is Delivered (currently ${order.delivery_status})`;
+   }
+   if (order.returns?.some(r => ['REQUESTED', 'OPEN', 'CLOSED'].includes(r.status))) {
+      return 'This order already has a return in progress or completed';
+   }
+   return null;
+};
+
 // Shared core for return-request creation - looks up nothing itself, takes an
 // already-fetched, already-Delivered-checked order. Used by both the mobile
 // customer endpoint and the admin one below, so the Shopify call + local
@@ -223,13 +241,9 @@ exports.requestOrderReturn = catchAsync(async (req, res, next) => {
       return next(new NotFoundError("Order not found or access denied"));
    }
 
-   // Can't return something that hasn't reached the customer yet - same
-   // style of guard as the cancel-after-pickup restriction on cancelOrder.
-   if (order.delivery_status !== 'Delivered') {
-      return res.status(400).json({
-         status: "fail",
-         message: `A return can only be requested once the order is Delivered (currently ${order.delivery_status})`
-      });
+   const blockReason = getReturnBlockReason(order);
+   if (blockReason) {
+      return res.status(400).json({ status: "fail", message: blockReason });
    }
 
    const { errors, shopifyReturn } = await submitReturnRequest(order, requestedLineItems);
@@ -246,8 +260,8 @@ exports.requestOrderReturn = catchAsync(async (req, res, next) => {
 
 // Admin dashboard: same return-request flow as the mobile endpoint above,
 // but for admin acting on the customer's behalf (e.g. a phone/support
-// request). Same Delivered-only restriction - a return only makes sense
-// once the customer has actually received the order.
+// request). Same restrictions - a return only makes sense once the customer
+// has actually received the order, and only one at a time per order.
 exports.adminRequestOrderReturn = catchAsync(async (req, res, next) => {
    const { id: orderId, line_items: requestedLineItems } = req.body;
 
@@ -258,11 +272,9 @@ exports.adminRequestOrderReturn = catchAsync(async (req, res, next) => {
    const order = await Order.findOne({ order_id: orderId });
    if (!order) throw new NotFoundError("Order not found");
 
-   if (order.delivery_status !== 'Delivered') {
-      return res.status(400).json({
-         status: "fail",
-         message: `A return can only be requested once the order is Delivered (currently ${order.delivery_status})`
-      });
+   const blockReason = getReturnBlockReason(order);
+   if (blockReason) {
+      return res.status(400).json({ status: "fail", message: blockReason });
    }
 
    const { errors, shopifyReturn } = await submitReturnRequest(order, requestedLineItems);
@@ -410,27 +422,34 @@ exports.adminProcessReturnRefund = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: 'fail', message: 'Shopify did not return a refund object' });
    }
 
-   // Record locally in the same shape refundOrderWebhook uses, so it shows
-   // up in the existing Refunds card right away rather than waiting on that
-   // webhook (which also might not be registered in Shopify yet).
+   // Record locally in the same shape refundOrderWebhook uses. Normalize the
+   // ID to the plain numeric form (GraphQL gives us a gid, the refunds/create
+   // webhook's REST-shaped payload gives the plain numeric ID) and check for
+   // an existing entry first - the refunds/create webhook (which does turn
+   // out to be registered on this store) can arrive before or after this
+   // call completes, and without matching ID formats the same refund was
+   // getting recorded twice, double-counting total_refunded.
+   const refundId = String(shopifyRefund.id).split('/').pop();
    const amount = parseFloat(shopifyRefund.totalRefundedSet?.shopMoney?.amount) || 0;
-   order.refunds.push({
-      refund_id: shopifyRefund.id,
-      created_at: new Date(),
-      note: `Processed via admin approval of return ${returnEntry.name || ''}`.trim(),
-      restock: false,
-      amount,
-      line_items: returnEntry.line_items.map(li => ({
-         line_item_id: li.line_item_id,
-         quantity: li.quantity,
-         title: li.title,
-         sku: li.sku,
-         vendor_id: li.vendor_id,
-         vendor_name: li.vendor_name,
-         subtotal: 0,
-         total_tax: 0
-      }))
-   });
+   if (!order.refunds.some(r => r.refund_id === refundId)) {
+      order.refunds.push({
+         refund_id: refundId,
+         created_at: new Date(),
+         note: `Processed via admin approval of return ${returnEntry.name || ''}`.trim(),
+         restock: false,
+         amount,
+         line_items: returnEntry.line_items.map(li => ({
+            line_item_id: li.line_item_id,
+            quantity: li.quantity,
+            title: li.title,
+            sku: li.sku,
+            vendor_id: li.vendor_id,
+            vendor_name: li.vendor_name,
+            subtotal: 0,
+            total_tax: 0
+         }))
+      });
+   }
    order.total_refunded = order.refunds.reduce((sum, r) => sum + (r.amount || 0), 0);
 
    const { data: closeData } = await shopifyGraphql.post("", {

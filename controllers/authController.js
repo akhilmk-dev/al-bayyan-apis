@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { generateAccessToken, generateRefreshToken } = require('../utils/generateTokens');
 const catchAsync = require('../utils/catchAsync');
-const { InternalServerError, EmptyRequestBodyError } = require('../utils/customErrors');
+const { InternalServerError, EmptyRequestBodyError, UnAuthorizedError } = require('../utils/customErrors');
 
 exports.login = catchAsync(async (req, res, next) => {
   const { email, password } = req.body;
@@ -18,10 +18,10 @@ exports.login = catchAsync(async (req, res, next) => {
        }
    });
  
-    if (!user) throw new InternalServerError("Invalid credentials");
+    if (!user) throw new UnAuthorizedError("Invalid credentials");
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) throw new InternalServerError("Invalid credentials");
+    if (!isMatch) throw new UnAuthorizedError("Invalid credentials");
 
   const accessToken = generateAccessToken(user);
   const refreshToken = generateRefreshToken(user);
@@ -57,7 +57,7 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
     await user.save();
     res.json({ status: 'success', accessToken: newAccessToken, refreshToken: newRefreshToken });
   } catch (err) {
-    return res.status(500).json({ status: 'error', message: 'Invalid refresh token' });
+    return res.status(401).json({ status: 'error', message: 'Invalid refresh token' });
   }
 });
 

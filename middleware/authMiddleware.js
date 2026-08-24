@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 
 const authenticate = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.sendStatus(401);
+  if (!authHeader) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
   const token = authHeader.split(' ')[1];
   try {
@@ -10,7 +10,7 @@ const authenticate = (req, res, next) => {
     req.user = decoded;
     next();
   } catch (err) {
-    return res.sendStatus(401);
+    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
   }
 };
 
