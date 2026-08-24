@@ -2319,13 +2319,16 @@ paths:
       tags: [Orders]
       summary: Cancel an order
       description: >
-        Requires the `Order fulfill` permission. First calls Shopify's `orderCancel`
-        GraphQL mutation so the cancellation actually takes effect on the live
-        Shopify order (inventory restock, financial/fulfillment status, reporting) -
+        Requires the `Order fulfill` permission. Blocked once `delivery_status` is
+        `Picked Up`, `Delivered`, or already `Cancelled` (`400`) - once an agent has
+        it in hand, cancelling would leave the physical delivery out of sync with
+        Shopify/inventory. Otherwise, first calls Shopify's `orderCancel` GraphQL
+        mutation so the cancellation actually takes effect on the live Shopify
+        order (inventory restock, financial/fulfillment status, reporting) -
         previously this endpoint only updated the local Mongo record, which let the
         "cancelled" status shown here drift from the real Shopify order. If Shopify
-        rejects the cancel (already cancelled, active return in progress, etc.) this
-        returns `400` with Shopify's error messages and makes no local change.
+        rejects the cancel (active return in progress, etc.) this also returns
+        `400` with Shopify's error messages and makes no local change.
         Cancellation is asynchronous on Shopify's side; the existing
         `orders/updated` webhook reconciles final status once Shopify's job
         completes. On success, sets `cancelled_at`, `cancel_reason`,
@@ -2360,16 +2363,20 @@ paths:
                   message: { type: string, example: Order cancelled }
                   data: { type: object }
         '400':
-          description: Shopify rejected the cancellation
+          description: >
+            Either already Picked Up/Delivered/Cancelled (checked locally, no
+            `errors` array in the body), or Shopify itself rejected the
+            cancellation (`errors` array present with Shopify's messages).
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { type: string, example: fail }
-                  message: { type: string, example: Shopify rejected the cancellation }
+                  message: { type: string, example: "Order can't be cancelled once it's Picked Up" }
                   errors:
                     type: array
+                    description: Only present when Shopify (not the local delivery_status check) rejected the cancel.
                     items:
                       type: object
                       properties:
@@ -2423,11 +2430,13 @@ paths:
       description: >
         Authenticated via the same shared static API key as live tracking
         (`x-api-key`), not JWT. Ownership is checked by matching `customerId`/
-        `orderId` against the order, same as the order-detail endpoint. Calls
-        Shopify's `returnRequest` mutation (status `REQUESTED`, needs merchant
-        approval in Shopify admin - not auto-opened) and records it under
-        `Order.returns`. Status is kept in sync afterwards via the
-        `returns/approve|decline|close` webhooks.
+        `orderId` against the order, same as the order-detail endpoint. Only
+        allowed once `delivery_status` is `Delivered` (`400` otherwise) - can't
+        return something that hasn't reached the customer yet. Calls Shopify's
+        `returnRequest` mutation (status `REQUESTED`, needs merchant approval in
+        Shopify admin - not auto-opened) and records it under `Order.returns`.
+        Status is kept in sync afterwards via the `returns/approve|decline|close`
+        webhooks.
       security:
         - trackingApiKey: []
       parameters:
@@ -2474,7 +2483,7 @@ paths:
                       name: { type: string }
                       status: { type: string, example: REQUESTED }
         '400':
-          description: Shopify rejected the return request, or line_items missing
+          description: Order isn't Delivered yet, line_items missing, or Shopify rejected the return request
         '401':
           description: Invalid or missing API key
         '404':

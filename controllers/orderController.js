@@ -102,6 +102,15 @@ exports.requestOrderReturn = catchAsync(async (req, res, next) => {
       return next(new NotFoundError("Order not found or access denied"));
    }
 
+   // Can't return something that hasn't reached the customer yet - same
+   // style of guard as the cancel-after-pickup restriction on cancelOrder.
+   if (order.delivery_status !== 'Delivered') {
+      return res.status(400).json({
+         status: "fail",
+         message: `A return can only be requested once the order is Delivered (currently ${order.delivery_status})`
+      });
+   }
+
    // Enrich against the order's own line items (already resolved from
    // Shopify metafields at order-sync time) - same approach as
    // refundOrderWebhook - and build Shopify's ReturnLineItemInput shape.
@@ -545,6 +554,19 @@ exports.cancelOrder = catchAsync(async (req, res, next) => {
    const orderCancelPayload = req.body;
    const order = await Order.findOne({ order_id: orderCancelPayload.id });
    if (!order) throw new NotFoundError("Order not found");
+
+   // Once an agent has picked it up (or it's already delivered/cancelled),
+   // the order is physically out with the customer - cancelling at that
+   // point would leave Shopify/inventory out of sync with a delivery that's
+   // already happening. Block it here rather than only relying on Shopify's
+   // own orderCancel rejection, since Shopify has no concept of our
+   // delivery_status and would otherwise happily cancel a picked-up order.
+   if (['Picked Up', 'Delivered', 'Cancelled'].includes(order.delivery_status)) {
+      return res.status(400).json({
+         status: "fail",
+         message: `Order can't be cancelled once it's ${order.delivery_status}`
+      });
+   }
 
    const user = await User.findById(req.user.id);
 
