@@ -10,7 +10,9 @@ const OrderTimeline = require('../models/OrderTimeline');
 const User = require('../models/User');
 const { geocodeAddress } = require('../utils/geocodeClient');
 const shopifyGraphql = require('../utils/shopifyGraphql');
-const { ORDER_CANCEL_MUTATION, RETURN_REQUEST_MUTATION, DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION } = require('../graphql/mutations/order.mutation');
+const { ORDER_CANCEL_MUTATION, RETURN_REQUEST_MUTATION, RETURN_APPROVE_MUTATION, RETURN_DECLINE_MUTATION, REFUND_CREATE_MUTATION, RETURN_CLOSE_MUTATION, DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION } = require('../graphql/mutations/order.mutation');
+const { ORDER_FULFILLMENT_LINE_ITEMS_QUERY, SUGGESTED_REFUND_QUERY } = require('../graphql/queries/order.query');
+const notifyCustomerStatus = require('../utils/notifyCustomerStatus');
 
 // get all orders
 exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
@@ -85,6 +87,125 @@ exports.getOrderDetailByCustomer = catchAsync(async (req, res, next) => {
 // approval in Shopify admin) rather than returnCreate (auto-open) - the
 // returns/request|approve|decline|close webhooks below keep the local
 // status in sync as the merchant processes it.
+// Shared core for return-request creation - looks up nothing itself, takes an
+// already-fetched, already-Delivered-checked order. Used by both the mobile
+// customer endpoint and the admin one below, so the Shopify call + local
+// Order.returns/timeline write only exist in one place.
+//
+// requestedLineItems items are keyed by `line_item_id` (Shopify's plain
+// LineItem ID, same as Order.line_items[].id) - NOT by
+// Order.line_items[].fulfillment_item_id, which is a FulfillmentOrder line
+// item ID captured at order-sync time for fulfillmentCreateV2 and is a
+// *different* Shopify resource from the FulfillmentLineItem ID the Returns
+// API actually needs. FulfillmentLineItem IDs only exist once a real
+// Fulfillment record exists (i.e. after shipping), so they're resolved live
+// here via ORDER_FULFILLMENT_LINE_ITEMS_QUERY instead of being stored.
+const submitReturnRequest = async (order, requestedLineItems) => {
+   const { data: fulfillmentData } = await shopifyGraphql.post("", {
+      query: ORDER_FULFILLMENT_LINE_ITEMS_QUERY,
+      variables: { orderId: `gid://shopify/Order/${order.order_id}` }
+   });
+
+   const fulfillmentLineItemIdByLineItemId = {};
+   for (const fulfillment of fulfillmentData?.data?.order?.fulfillments || []) {
+      for (const fli of fulfillment.fulfillmentLineItems?.nodes || []) {
+         const lineItemNumericId = fli.lineItem?.id?.split('/').pop();
+         if (lineItemNumericId) fulfillmentLineItemIdByLineItemId[lineItemNumericId] = fli.id;
+      }
+   }
+
+   const shopifyReturnLineItems = [];
+   const localReturnLineItems = [];
+   const unresolvedItems = [];
+   for (const requested of requestedLineItems) {
+      const orderLineItem = order.line_items.find(
+         li => String(li.id) === String(requested.line_item_id)
+      );
+      const fulfillmentLineItemId = fulfillmentLineItemIdByLineItemId[String(requested.line_item_id)];
+      if (!fulfillmentLineItemId) {
+         unresolvedItems.push(requested.line_item_id);
+         continue;
+      }
+      shopifyReturnLineItems.push({
+         fulfillmentLineItemId,
+         quantity: requested.quantity,
+         returnReason: requested.return_reason || 'OTHER',
+         // Shopify's actual field name here is `customerNote`, not
+         // `returnReasonNote` (that name only exists on a different,
+         // similarly-named input type used elsewhere in the Returns API -
+         // confirmed by introspecting ReturnRequestLineItemInput directly).
+         customerNote: requested.return_reason_note || null
+      });
+      localReturnLineItems.push({
+         fulfillment_line_item_id: fulfillmentLineItemId,
+         line_item_id: orderLineItem?.id || String(requested.line_item_id ?? ''),
+         quantity: requested.quantity,
+         title: orderLineItem?.title || null,
+         sku: orderLineItem?.sku || null,
+         vendor_id: orderLineItem?.vendor_id || null,
+         vendor_name: orderLineItem?.vendor_name || null,
+         return_reason: requested.return_reason || 'OTHER',
+         return_reason_note: requested.return_reason_note || null
+      });
+   }
+
+   if (unresolvedItems.length) {
+      return { errors: [{ message: `These items haven't been fulfilled/shipped yet and can't be returned: ${unresolvedItems.join(', ')}` }] };
+   }
+
+   const { data } = await shopifyGraphql.post("", {
+      query: RETURN_REQUEST_MUTATION,
+      variables: {
+         input: {
+            orderId: `gid://shopify/Order/${order.order_id}`,
+            returnLineItems: shopifyReturnLineItems
+         }
+      }
+   });
+
+   // GraphQL execution errors (bad variable shape, syntax, etc.) land in a
+   // top-level `errors` array with no `data.returnRequest` at all - this was
+   // previously unchecked, so a malformed request silently fell through to
+   // "success" with a null return_id/name instead of actually failing.
+   if (data?.errors?.length) {
+      console.error('Return request GraphQL errors:', JSON.stringify(data.errors));
+      return { errors: data.errors.map(e => ({ message: e.message })) };
+   }
+
+   const returnErrors = data?.data?.returnRequest?.userErrors;
+   if (returnErrors?.length) {
+      return { errors: returnErrors };
+   }
+
+   const shopifyReturn = data?.data?.returnRequest?.return;
+   if (!shopifyReturn?.id) {
+      // Defensive - Shopify accepted the request but returned no return
+      // object and no errors either. Don't silently record a fake return.
+      console.error('Return request returned no return object and no errors:', JSON.stringify(data));
+      return { errors: [{ message: 'Shopify did not return a return object' }] };
+   }
+   order.returns.push({
+      return_id: shopifyReturn?.id || null,
+      name: shopifyReturn?.name || null,
+      status: shopifyReturn?.status || 'REQUESTED',
+      requested_at: shopifyReturn?.createdAt || new Date(),
+      line_items: localReturnLineItems
+   });
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Return Requested',
+      changes: { return_id: shopifyReturn?.id, line_items: localReturnLineItems },
+      message: `Return ${shopifyReturn?.name || ''} requested`.trim()
+   });
+
+   return { shopifyReturn };
+};
+
+// Mobile app: customer requests a return on their own order. Auth is the
+// same shared static API key as live tracking - ownership is checked by
+// matching customerId/orderId, same as getOrderDetailByCustomer.
 exports.requestOrderReturn = catchAsync(async (req, res, next) => {
    const { customerId, orderId } = req.params;
    const cId = Number(customerId);
@@ -111,74 +232,242 @@ exports.requestOrderReturn = catchAsync(async (req, res, next) => {
       });
    }
 
-   // Enrich against the order's own line items (already resolved from
-   // Shopify metafields at order-sync time) - same approach as
-   // refundOrderWebhook - and build Shopify's ReturnLineItemInput shape.
-   const shopifyReturnLineItems = [];
-   const localReturnLineItems = [];
-   for (const requested of requestedLineItems) {
-      const orderLineItem = order.line_items.find(
-         li => String(li.fulfillment_item_id) === String(requested.fulfillment_line_item_id)
-      );
-      shopifyReturnLineItems.push({
-         fulfillmentLineItemId: `gid://shopify/FulfillmentLineItem/${requested.fulfillment_line_item_id}`,
-         quantity: requested.quantity,
-         returnReason: requested.return_reason || 'OTHER',
-         returnReasonNote: requested.return_reason_note || null
-      });
-      localReturnLineItems.push({
-         fulfillment_line_item_id: String(requested.fulfillment_line_item_id ?? ''),
-         line_item_id: orderLineItem?.id || null,
-         quantity: requested.quantity,
-         title: orderLineItem?.title || null,
-         sku: orderLineItem?.sku || null,
-         vendor_id: orderLineItem?.vendor_id || null,
-         vendor_name: orderLineItem?.vendor_name || null,
-         return_reason: requested.return_reason || 'OTHER',
-         return_reason_note: requested.return_reason_note || null
-      });
+   const { errors, shopifyReturn } = await submitReturnRequest(order, requestedLineItems);
+   if (errors) {
+      return res.status(400).json({ status: "fail", message: "Shopify rejected the return request", errors });
    }
-
-   const { data } = await shopifyGraphql.post("", {
-      query: RETURN_REQUEST_MUTATION,
-      variables: {
-         input: {
-            orderId: `gid://shopify/Order/${order.order_id}`,
-            returnLineItems: shopifyReturnLineItems
-         }
-      }
-   });
-
-   const returnErrors = data?.data?.returnRequest?.userErrors;
-   if (returnErrors?.length) {
-      return res.status(400).json({
-         status: "fail",
-         message: "Shopify rejected the return request",
-         errors: returnErrors
-      });
-   }
-
-   const shopifyReturn = data?.data?.returnRequest?.return;
-   order.returns.push({
-      return_id: shopifyReturn?.id || null,
-      name: shopifyReturn?.name || null,
-      status: shopifyReturn?.status || 'REQUESTED',
-      requested_at: shopifyReturn?.createdAt || new Date(),
-      line_items: localReturnLineItems
-   });
-   await order.save();
-
-   await OrderTimeline.create({
-      order_id: order.order_id,
-      action: 'Return Requested',
-      changes: { return_id: shopifyReturn?.id, line_items: localReturnLineItems },
-      message: `Return ${shopifyReturn?.name || ''} requested`.trim()
-   });
 
    res.status(200).json({
       status: "success",
       message: "Return requested",
       data: { return_id: shopifyReturn?.id, name: shopifyReturn?.name, status: shopifyReturn?.status || 'REQUESTED' }
+   });
+});
+
+// Admin dashboard: same return-request flow as the mobile endpoint above,
+// but for admin acting on the customer's behalf (e.g. a phone/support
+// request). Same Delivered-only restriction - a return only makes sense
+// once the customer has actually received the order.
+exports.adminRequestOrderReturn = catchAsync(async (req, res, next) => {
+   const { id: orderId, line_items: requestedLineItems } = req.body;
+
+   if (!Array.isArray(requestedLineItems) || requestedLineItems.length === 0) {
+      return res.status(400).json({ status: 'fail', message: 'line_items is required' });
+   }
+
+   const order = await Order.findOne({ order_id: orderId });
+   if (!order) throw new NotFoundError("Order not found");
+
+   if (order.delivery_status !== 'Delivered') {
+      return res.status(400).json({
+         status: "fail",
+         message: `A return can only be requested once the order is Delivered (currently ${order.delivery_status})`
+      });
+   }
+
+   const { errors, shopifyReturn } = await submitReturnRequest(order, requestedLineItems);
+   if (errors) {
+      return res.status(400).json({ status: "fail", message: "Shopify rejected the return request", errors });
+   }
+
+   res.status(200).json({
+      status: "success",
+      message: "Return requested",
+      data: { return_id: shopifyReturn?.id, name: shopifyReturn?.name, status: shopifyReturn?.status || 'REQUESTED' }
+   });
+});
+
+const VALID_DECLINE_REASONS = ['RETURN_PERIOD_ENDED', 'FINAL_SALE', 'OTHER'];
+
+// Admin approves a REQUESTED return - moves it to OPEN (Shopify has no
+// separate "APPROVED" status) both in Shopify and locally, immediately -
+// doesn't wait on the returns/approve webhook, which may not even be
+// registered in Shopify yet (see HANDOVER.md).
+exports.adminApproveReturn = catchAsync(async (req, res, next) => {
+   const { return_id } = req.body;
+   const order = await Order.findOne({ 'returns.return_id': return_id });
+   if (!order) throw new NotFoundError('Return not found');
+   const returnEntry = order.returns.find(r => r.return_id === return_id);
+
+   const { data } = await shopifyGraphql.post("", {
+      query: RETURN_APPROVE_MUTATION,
+      variables: { input: { id: return_id, notifyCustomer: !!req.body.notify_customer } }
+   });
+
+   const errors = data?.errors?.map(e => ({ message: e.message })) || data?.data?.returnApproveRequest?.userErrors;
+   if (errors?.length) {
+      return res.status(400).json({ status: 'fail', message: 'Shopify rejected the approval', errors });
+   }
+
+   const shopifyReturn = data?.data?.returnApproveRequest?.return;
+   returnEntry.status = shopifyReturn?.status || 'OPEN';
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Return Approved',
+      changes: { return_id },
+      message: `Return ${returnEntry.name || ''} approved by admin`.trim()
+   });
+
+   res.status(200).json({ status: 'success', message: 'Return approved', data: { return_id, status: returnEntry.status } });
+});
+
+// Admin declines a REQUESTED return.
+exports.adminDeclineReturn = catchAsync(async (req, res, next) => {
+   const { return_id, decline_reason, decline_note } = req.body;
+   const order = await Order.findOne({ 'returns.return_id': return_id });
+   if (!order) throw new NotFoundError('Return not found');
+   const returnEntry = order.returns.find(r => r.return_id === return_id);
+
+   const reason = VALID_DECLINE_REASONS.includes(decline_reason) ? decline_reason : 'OTHER';
+   const { data } = await shopifyGraphql.post("", {
+      query: RETURN_DECLINE_MUTATION,
+      variables: { input: { id: return_id, declineReason: reason, declineNote: decline_note || null, notifyCustomer: !!req.body.notify_customer } }
+   });
+
+   const errors = data?.errors?.map(e => ({ message: e.message })) || data?.data?.returnDeclineRequest?.userErrors;
+   if (errors?.length) {
+      return res.status(400).json({ status: 'fail', message: 'Shopify rejected the decline', errors });
+   }
+
+   const shopifyReturn = data?.data?.returnDeclineRequest?.return;
+   returnEntry.status = shopifyReturn?.status || 'DECLINED';
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Return Declined',
+      changes: { return_id, decline_reason: reason, decline_note },
+      message: `Return ${returnEntry.name || ''} declined by admin${decline_note ? ` (${decline_note})` : ''}`.trim()
+   });
+
+   res.status(200).json({ status: 'success', message: 'Return declined', data: { return_id, status: returnEntry.status } });
+});
+
+// Admin processes the refund for an approved (OPEN) return - the actual
+// money-moving step. Uses Shopify's own suggestedRefund query to compute the
+// correct amount/gateway/transaction-to-refund-against, then forwards that
+// straight into refundCreate rather than hand-computing it (the standard,
+// safe pattern Shopify's own admin uses). Closes the return afterward.
+exports.adminProcessReturnRefund = catchAsync(async (req, res, next) => {
+   const { return_id } = req.body;
+   const order = await Order.findOne({ 'returns.return_id': return_id });
+   if (!order) throw new NotFoundError('Return not found');
+   const returnEntry = order.returns.find(r => r.return_id === return_id);
+
+   if (returnEntry.status !== 'OPEN') {
+      return res.status(400).json({
+         status: 'fail',
+         message: `Return must be approved (Open) before processing a refund - currently ${returnEntry.status}`
+      });
+   }
+
+   const orderGid = `gid://shopify/Order/${order.order_id}`;
+   const refundLineItemsInput = returnEntry.line_items.map(li => ({
+      lineItemId: `gid://shopify/LineItem/${li.line_item_id}`,
+      quantity: li.quantity
+   }));
+
+   const { data: suggestedData } = await shopifyGraphql.post("", {
+      query: SUGGESTED_REFUND_QUERY,
+      variables: { orderId: orderGid, refundLineItems: refundLineItemsInput }
+   });
+
+   if (suggestedData?.errors?.length) {
+      return res.status(400).json({ status: 'fail', message: 'Could not calculate refund amount', errors: suggestedData.errors });
+   }
+   const suggestion = suggestedData?.data?.order?.suggestedRefund;
+   if (!suggestion) {
+      return res.status(400).json({ status: 'fail', message: 'Shopify returned no refund suggestion for this return' });
+   }
+
+   const refundLineItems = suggestion.refundLineItems.map(rli => ({
+      lineItemId: rli.lineItem.id,
+      quantity: rli.quantity
+   }));
+   const transactions = suggestion.suggestedTransactions.map(tx => ({
+      orderId: orderGid,
+      kind: 'REFUND',
+      gateway: tx.gateway,
+      amount: tx.amountSet.shopMoney.amount,
+      parentId: tx.parentTransaction?.id
+   }));
+
+   const { data } = await shopifyGraphql.post("", {
+      query: REFUND_CREATE_MUTATION,
+      variables: {
+         input: { orderId: orderGid, refundLineItems, transactions, notify: !!req.body.notify_customer }
+      }
+   });
+
+   const refundErrors = data?.errors?.map(e => ({ message: e.message })) || data?.data?.refundCreate?.userErrors;
+   if (refundErrors?.length) {
+      return res.status(400).json({ status: 'fail', message: 'Shopify rejected the refund', errors: refundErrors });
+   }
+   const shopifyRefund = data?.data?.refundCreate?.refund;
+   if (!shopifyRefund?.id) {
+      return res.status(400).json({ status: 'fail', message: 'Shopify did not return a refund object' });
+   }
+
+   // Record locally in the same shape refundOrderWebhook uses, so it shows
+   // up in the existing Refunds card right away rather than waiting on that
+   // webhook (which also might not be registered in Shopify yet).
+   const amount = parseFloat(shopifyRefund.totalRefundedSet?.shopMoney?.amount) || 0;
+   order.refunds.push({
+      refund_id: shopifyRefund.id,
+      created_at: new Date(),
+      note: `Processed via admin approval of return ${returnEntry.name || ''}`.trim(),
+      restock: false,
+      amount,
+      line_items: returnEntry.line_items.map(li => ({
+         line_item_id: li.line_item_id,
+         quantity: li.quantity,
+         title: li.title,
+         sku: li.sku,
+         vendor_id: li.vendor_id,
+         vendor_name: li.vendor_name,
+         subtotal: 0,
+         total_tax: 0
+      }))
+   });
+   order.total_refunded = order.refunds.reduce((sum, r) => sum + (r.amount || 0), 0);
+
+   const { data: closeData } = await shopifyGraphql.post("", {
+      query: RETURN_CLOSE_MUTATION,
+      variables: { id: return_id }
+   });
+   const closeErrors = closeData?.errors || closeData?.data?.returnClose?.userErrors;
+   if (closeErrors?.length) {
+      console.error('returnClose failed after refund (refund itself already succeeded):', JSON.stringify(closeErrors));
+   }
+   const closedStatus = closeData?.data?.returnClose?.return?.status;
+   if (closedStatus) {
+      returnEntry.status = closedStatus;
+      returnEntry.closed_at = new Date();
+   }
+
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Refunded',
+      changes: { return_id, refund_id: shopifyRefund.id, amount },
+      message: `Refund of ${amount} ${order.currency || ''} processed for return ${returnEntry.name || ''}`.trim()
+   });
+   if (closedStatus) {
+      await OrderTimeline.create({
+         order_id: order.order_id,
+         action: 'Return Closed',
+         changes: { return_id },
+         message: `Return ${returnEntry.name || ''} closed`.trim()
+      });
+   }
+
+   res.status(200).json({
+      status: 'success',
+      message: 'Refund processed',
+      data: { refund_id: shopifyRefund.id, amount, return_status: returnEntry.status }
    });
 });
 
@@ -601,6 +890,7 @@ exports.cancelOrder = catchAsync(async (req, res, next) => {
    order.cancelled_at = orderCancelPayload?.cancelled_at || new Date();
    order.cancel_reason = orderCancelPayload?.cancel_reason;
    order.financial_status = orderCancelPayload?.financial_status;
+   order.delivery_status = 'Cancelled';
    order.modified_by = req.user.id; // Track modification
    const now = new Date();
    order.line_items = order.line_items.map(item => ({
@@ -609,6 +899,7 @@ exports.cancelOrder = catchAsync(async (req, res, next) => {
    }));
    order.current_location = undefined;
    await order.save();
+   await notifyCustomerStatus(order, 'Cancelled');
 
    await OrderTimeline.create({
       order_id: order.order_id,
@@ -736,6 +1027,7 @@ exports.fulfilOrder = catchAsync(async (req, res, next) => {
       order.current_location = undefined;
 
       const data = await order.save();
+      await notifyCustomerStatus(order, 'Delivered');
       await OrderTimeline.create({
          order_id: order.order_id,
          action: 'Delivered',
@@ -841,19 +1133,29 @@ exports.fulfillSingleItem = catchAsync(async (req, res, next) => {
        const allFulfilled = order.line_items.every(item => item.fulfillment_status === 'Fulfilled');
        if (allFulfilled) {
          order.fulfillment_status = 'Fulfilled';
+         // Keep delivery_status in sync - fulfilOrder already does this for
+         // full-order fulfillment; this per-item path was missing it, which
+         // let an order display "Delivered" (driven by fulfillment_status)
+         // while delivery_status stayed Pending/Picked Up, leaving actions
+         // like Cancel (gated on delivery_status) incorrectly still allowed.
+         order.delivery_status = 'Delivered';
+         order.delivered_at = new Date();
        }
 
        order.modified_by = req.user.id; // Track modification
-        
+
        // Auto-assignment for unassigned orders
        if (!order.assigned_agent) {
           order.assigned_agent = req.user.id;
           order.agent_type = 'User';
           order.assignment_date = new Date();
        }
- 
+
        const result = await order.save();
- 
+       if (allFulfilled) {
+         await notifyCustomerStatus(order, 'Delivered');
+       }
+
        await OrderTimeline.create({
          order_id: order.order_id,
          action: 'Fulfilled',
@@ -897,6 +1199,7 @@ exports.pickupOrder = catchAsync(async (req, res, next) => {
    }
 
    await order.save();
+   await notifyCustomerStatus(order, 'Picked Up');
 
    await OrderTimeline.create({
       order_id: order.order_id,

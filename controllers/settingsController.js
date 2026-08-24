@@ -9,10 +9,11 @@ exports.getSettings = catchAsync(async (req, res) => {
 
 // Update settings (singleton)
 exports.updateSettings = catchAsync(async (req, res) => {
-  const { delivery_earning_rate } = req.body;
+  const { delivery_earning_rate, assignment_reminder_minutes } = req.body;
   const settings = await Settings.getSingleton();
 
-  settings.delivery_earning_rate = delivery_earning_rate;
+  if (delivery_earning_rate !== undefined) settings.delivery_earning_rate = delivery_earning_rate;
+  if (assignment_reminder_minutes !== undefined) settings.assignment_reminder_minutes = assignment_reminder_minutes;
   settings.updated_by = req.user.id;
   await settings.save();
 

@@ -1,5 +1,5 @@
 const express = require('express');
-const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, refundOrderWebhook, requestOrderReturn, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
+const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, refundOrderWebhook, requestOrderReturn, adminRequestOrderReturn, adminApproveReturn, adminDeclineReturn, adminProcessReturnRefund, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
 const { authenticate } = require('../middleware/authMiddleware');
 const { requirePermission } = require('../middleware/permissionMiddleware');
 const { requireTrackingApiKey } = require('../middleware/trackingAuthMiddleware');
@@ -29,6 +29,10 @@ router.post('/return-closed', returnClosedWebhook);
 router.get('/all/:id',authenticate,requirePermission('Order Details'),getOrderById);
 router.post('/update',authenticate,requirePermission('Order fulfill'),updateOrder);
 router.post('/cancel',authenticate,requirePermission('Order fulfill'),cancelOrder);
+router.post('/return',authenticate,requirePermission('Order fulfill'),adminRequestOrderReturn);
+router.post('/return/approve',authenticate,requirePermission('Order fulfill'),adminApproveReturn);
+router.post('/return/decline',authenticate,requirePermission('Order fulfill'),adminDeclineReturn);
+router.post('/return/refund',authenticate,requirePermission('Order fulfill'),adminProcessReturnRefund);
 router.post('/fulfilled',authenticate,requirePermission('Order fulfill'),fulfilOrder);
 router.post('/fulfillSingleItem',authenticate,requirePermission('Order fulfill'),fulfillSingleItem);
 router.post('/delete',authenticate,requirePermission('Order Delete'),deleteOrder);

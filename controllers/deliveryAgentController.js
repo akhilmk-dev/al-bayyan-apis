@@ -12,7 +12,8 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const getFullUrl = require('../utils/fullUrl');
-const sendNotification = require('../utils/sendNotification');
+const { sendNotification } = require('../utils/sendNotification');
+const notifyCustomerStatus = require('../utils/notifyCustomerStatus');
 const { sendEmail } = require('../utils/emailClient');
 const axios = require('axios');
 
@@ -207,6 +208,7 @@ exports.assignAgentToOrder = catchAsync(async (req, res, next) => {
     order.assignment_date = new Date();
     order.delivery_status = 'Pending';
     order.assignment_status = 'pending_acceptance';
+    order.reminder_sent_at = null;
     await order.save();
 
     // Send push notification to the assigned delivery agent
@@ -595,6 +597,9 @@ exports.updateDeliveryStatus = catchAsync(async (req, res, next) => {
     }
 
     await order.save();
+    if (status === 'Picked Up' || status === 'Cancelled') {
+        await notifyCustomerStatus(order, status);
+    }
 
     // Create timeline entry
     await OrderTimeline.create({
@@ -700,6 +705,7 @@ const completeDelivery = async (order) => {
     order.delivery_otp_expiry = null;
 
     await order.save();
+    await notifyCustomerStatus(order, 'Delivered');
 
     await OrderTimeline.create({
         order_id: order.order_id,
@@ -839,6 +845,7 @@ exports.acceptOrder = catchAsync(async (req, res, next) => {
     order.picked_up_at = new Date();
     order.fulfillment_status = 'scheduled';
     await order.save();
+    await notifyCustomerStatus(order, 'Picked Up');
 
     await OrderTimeline.create({
         order_id: order.order_id,

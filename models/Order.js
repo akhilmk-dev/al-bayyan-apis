@@ -134,6 +134,10 @@ const orderSchema = new mongoose.Schema({
   // delivery_status. Accepting moves delivery_status straight to 'Picked Up'
   // (no separate manual pickup step); rejecting clears the assignment.
   assignment_status: { type: String, enum: ['pending_acceptance', 'accepted', 'rejected'], default: null },
+  // Set once jobs/deliveryReminderJob.js pings the agent about a stale
+  // pending_acceptance assignment, so it only fires once per assignment
+  // cycle. Reset to null on every (re)assignment in assignAgentToOrder.
+  reminder_sent_at: { type: Date, default: null },
   // Persistent history of agents who rejected this order, so they're excluded
   // from being reassigned to it again. Accumulates across reassignment cycles.
   rejected_agents: [{

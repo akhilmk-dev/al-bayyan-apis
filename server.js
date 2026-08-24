@@ -21,7 +21,9 @@ const cors = require('cors');
 const errorHandler = require('./middleware/errorHandler');
 const clc = require('cli-color');
 const morgan = require('morgan');
+const deliveryReminderJob = require('./jobs/deliveryReminderJob');
 connectDB();
+deliveryReminderJob.start();
 
 const app = express();
 

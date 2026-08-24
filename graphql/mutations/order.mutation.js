@@ -52,6 +52,81 @@ const RETURN_REQUEST_MUTATION = `
   }
 `;
 
+// Approves a REQUESTED return, moving it to OPEN - the return's status field
+// (not a distinct "APPROVED" status). Admin-triggered, called directly on
+// approve so the local Order.returns status updates immediately rather than
+// waiting on the returns/approve webhook (which also isn't necessarily
+// registered in Shopify - see HANDOVER.md).
+const RETURN_APPROVE_MUTATION = `
+  mutation ReturnApproveRequest($input: ReturnApproveRequestInput!) {
+    returnApproveRequest(input: $input) {
+      return {
+        id
+        name
+        status
+      }
+      userErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
+// ReturnDeclineReason enum: RETURN_PERIOD_ENDED | FINAL_SALE | OTHER
+const RETURN_DECLINE_MUTATION = `
+  mutation ReturnDeclineRequest($input: ReturnDeclineRequestInput!) {
+    returnDeclineRequest(input: $input) {
+      return {
+        id
+        name
+        status
+      }
+      userErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
+// Actually moves money - takes the exact refundLineItems/transactions shape
+// straight out of the suggestedRefund query below (Shopify's own recommended
+// pattern: query the suggestion, then submit it as-is to refundCreate rather
+// than hand-computing amounts/gateway/parentId ourselves).
+const REFUND_CREATE_MUTATION = `
+  mutation RefundCreate($input: RefundInput!) {
+    refundCreate(input: $input) {
+      refund {
+        id
+        totalRefundedSet { shopMoney { amount } }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+// Marks a return fully processed/complete - called after issuing its refund.
+const RETURN_CLOSE_MUTATION = `
+  mutation ReturnClose($id: ID!) {
+    returnClose(id: $id) {
+      return {
+        id
+        status
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 // Reorder: Shopify has no dedicated "reorder" mutation, but
 // draftOrderCreateFromOrder is the purpose-built equivalent - it duplicates
 // an existing order's line items/discounts/shipping into a new Draft Order
@@ -81,5 +156,9 @@ const DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION = `
 module.exports = {
   ORDER_CANCEL_MUTATION,
   RETURN_REQUEST_MUTATION,
+  RETURN_APPROVE_MUTATION,
+  RETURN_DECLINE_MUTATION,
+  REFUND_CREATE_MUTATION,
+  RETURN_CLOSE_MUTATION,
   DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION
 };
