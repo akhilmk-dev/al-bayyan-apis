@@ -19,13 +19,18 @@ const notifyCustomerStatus = require('../utils/notifyCustomerStatus');
 // `refunds` arrays already present on every order document - saves the
 // mobile app from having to parse those arrays itself for the common case
 // of "does this order have a return, what's it doing, has it been refunded".
-const withReturnRefundSummary = (order) => ({
-   ...order,
-   return_status: order.returns?.length
-      ? order.returns[order.returns.length - 1].status
-      : null,
-   is_refunded: (order.total_refunded || 0) > 0
-});
+const withReturnRefundSummary = (order) => {
+   const latestReturn = order.returns?.length ? order.returns[order.returns.length - 1] : null;
+   return {
+      ...order,
+      return_status: latestReturn?.status || null,
+      // Only meaningful when return_status is 'DECLINED' - lets the mobile
+      // app show why admin rejected the request without parsing `timeline`.
+      return_decline_reason: latestReturn?.status === 'DECLINED' ? latestReturn.decline_reason : null,
+      return_decline_note: latestReturn?.status === 'DECLINED' ? latestReturn.decline_note : null,
+      is_refunded: (order.total_refunded || 0) > 0
+   };
+};
 
 exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
    const customerId = Number(req.params.customerId);
@@ -148,6 +153,18 @@ const submitReturnRequest = async (order, requestedLineItems) => {
    const localReturnLineItems = [];
    const unresolvedItems = [];
    for (const requested of requestedLineItems) {
+      if (!requested?.line_item_id) {
+         // Common client-side mistake: the request-body contract used to key
+         // items by `fulfillment_line_item_id` (see comment above) - a client
+         // still on that old contract lands here instead of matching below,
+         // so call it out explicitly rather than failing with "unresolved".
+         unresolvedItems.push(
+            requested?.fulfillment_line_item_id
+               ? `${requested.fulfillment_line_item_id} (sent as 'fulfillment_line_item_id' - this endpoint requires 'line_item_id' instead)`
+               : '(missing line_item_id)'
+         );
+         continue;
+      }
       const orderLineItem = order.line_items.find(
          li => String(li.id) === String(requested.line_item_id)
       );
@@ -357,6 +374,9 @@ exports.adminDeclineReturn = catchAsync(async (req, res, next) => {
 
    const shopifyReturn = data?.data?.returnDeclineRequest?.return;
    returnEntry.status = shopifyReturn?.status || 'DECLINED';
+   returnEntry.decline_reason = reason;
+   returnEntry.decline_note = decline_note || null;
+   returnEntry.declined_at = new Date();
    await order.save();
 
    await OrderTimeline.create({

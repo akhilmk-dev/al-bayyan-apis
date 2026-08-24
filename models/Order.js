@@ -65,6 +65,11 @@ const returnSchema = new mongoose.Schema({
   status: { type: String, enum: ['REQUESTED', 'OPEN', 'DECLINED', 'CANCELED', 'CLOSED'], default: 'REQUESTED' },
   requested_at: { type: Date },
   closed_at: { type: Date, default: null },
+  // Only set when status is DECLINED - carried here (not just OrderTimeline)
+  // so the mobile app can read the rejection reason directly off the order.
+  decline_reason: { type: String, default: null },
+  decline_note: { type: String, default: null },
+  declined_at: { type: Date, default: null },
   line_items: [returnLineItemSchema]
 }, { _id: false });
 
