@@ -18,6 +18,56 @@ const lineItemSchema = new mongoose.Schema({
   image: { type: String }
 }, { _id: true });
 
+// One entry per Shopify `refunds/create` webhook event. Append-only - a
+// second partial refund on the same order adds a new entry rather than
+// merging into the first, mirroring how Shopify itself keeps refunds as
+// separate records under an order.
+const refundLineItemSchema = new mongoose.Schema({
+  line_item_id: { type: String },
+  quantity: { type: Number },
+  title: { type: String },
+  sku: { type: String },
+  vendor_id: { type: String },
+  vendor_name: { type: String },
+  restock_type: { type: String },
+  subtotal: { type: Number, default: 0 },
+  total_tax: { type: Number, default: 0 }
+}, { _id: false });
+
+const refundSchema = new mongoose.Schema({
+  refund_id: { type: String },
+  created_at: { type: Date },
+  note: { type: String, default: null },
+  restock: { type: Boolean, default: false },
+  amount: { type: Number, default: 0 },
+  line_items: [refundLineItemSchema]
+}, { _id: false });
+
+// One entry per Shopify Return (requestReturn from the mobile app, or a
+// return created directly in Shopify) - status moves REQUESTED -> OPEN
+// (approved) or DECLINED, then eventually CLOSED, synced in via the
+// returns/request|approve|decline|close webhooks.
+const returnLineItemSchema = new mongoose.Schema({
+  fulfillment_line_item_id: { type: String },
+  line_item_id: { type: String },
+  quantity: { type: Number },
+  title: { type: String },
+  sku: { type: String },
+  vendor_id: { type: String },
+  vendor_name: { type: String },
+  return_reason: { type: String },
+  return_reason_note: { type: String, default: null }
+}, { _id: false });
+
+const returnSchema = new mongoose.Schema({
+  return_id: { type: String },
+  name: { type: String },
+  status: { type: String, enum: ['REQUESTED', 'OPEN', 'DECLINED', 'CANCELED', 'CLOSED'], default: 'REQUESTED' },
+  requested_at: { type: Date },
+  closed_at: { type: Date, default: null },
+  line_items: [returnLineItemSchema]
+}, { _id: false });
+
 const orderSchema = new mongoose.Schema({
   order_id: { type: String, unique: true },
   fulfillment_id:{type:String},
@@ -101,7 +151,14 @@ const orderSchema = new mongoose.Schema({
     latitude: { type: Number, default: null },
     longitude: { type: Number, default: null },
     updated_at: { type: Date, default: null }
-  }
+  },
+  // Populated from the Shopify `refunds/create` webhook. financial_status
+  // (partially_refunded/refunded) still comes from the regular orders/updated
+  // sync - this just adds the structured "what/how much" detail Shopify's
+  // order-level fields don't carry.
+  refunds: [refundSchema],
+  total_refunded: { type: Number, default: 0 },
+  returns: [returnSchema]
 });
 
 module.exports = mongoose.model('Order', orderSchema);

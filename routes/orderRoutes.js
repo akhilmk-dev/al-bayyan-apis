@@ -1,5 +1,5 @@
 const express = require('express');
-const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking } = require('../controllers/orderController');
+const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, refundOrderWebhook, requestOrderReturn, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
 const { authenticate } = require('../middleware/authMiddleware');
 const { requirePermission } = require('../middleware/permissionMiddleware');
 const { requireTrackingApiKey } = require('../middleware/trackingAuthMiddleware');
@@ -7,12 +7,24 @@ const router = express.Router();
 
 router.get('/',authenticate,requirePermission('Order List'),getOrders);
 router.post('/',createOrder);
+// Shopify webhook receiver for `refunds/create` (order returns/refunds) -
+// public, no bearer JWT, same pattern as the order-create receiver above.
+router.post('/refund', refundOrderWebhook);
 router.get(`/:id`,authenticate,requirePermission('Order List'),getOrderByVendor);
 // customer orders
 router.get('/customer/:customerId',getOrdersByCustomer);
 router.get('/customer/:customerId/:orderId',getOrderDetailByCustomer);
 // live tracking (external customer app, shared API key auth)
 router.get('/track/:orderId', requireTrackingApiKey, getOrderTracking);
+// mobile app: return request + reorder (same shared API key as tracking above)
+router.post('/customer/:customerId/:orderId/return', requireTrackingApiKey, requestOrderReturn);
+router.post('/customer/:customerId/:orderId/reorder', requireTrackingApiKey, reorderCustomerOrder);
+// Shopify webhook receivers for the return lifecycle - public, no bearer JWT,
+// same pattern as /refund above.
+router.post('/return-requested', returnRequestedWebhook);
+router.post('/return-approved', returnApprovedWebhook);
+router.post('/return-declined', returnDeclinedWebhook);
+router.post('/return-closed', returnClosedWebhook);
 // full order details
 router.get('/all/:id',authenticate,requirePermission('Order Details'),getOrderById);
 router.post('/update',authenticate,requirePermission('Order fulfill'),updateOrder);

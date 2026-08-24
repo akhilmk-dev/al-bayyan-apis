@@ -9,6 +9,8 @@ const RemovedLineItem = require('../models/RemovedLineItem');
 const OrderTimeline = require('../models/OrderTimeline');
 const User = require('../models/User');
 const { geocodeAddress } = require('../utils/geocodeClient');
+const shopifyGraphql = require('../utils/shopifyGraphql');
+const { ORDER_CANCEL_MUTATION, RETURN_REQUEST_MUTATION, DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION } = require('../graphql/mutations/order.mutation');
 
 // get all orders
 exports.getOrdersByCustomer = catchAsync(async (req, res, next) => {
@@ -69,6 +71,159 @@ exports.getOrderDetailByCustomer = catchAsync(async (req, res, next) => {
          ...order,
          removed_line_items: removedItems,
          timeline,
+      }
+   });
+});
+
+// Mobile app: customer requests a return on their own order. Auth is the
+// same shared static API key as live tracking (see
+// middleware/trackingAuthMiddleware.js) - this app has no per-customer login
+// token yet, so ownership is only checked by customer.id/order_id matching,
+// same as getOrderDetailByCustomer above.
+//
+// Uses Shopify's returnRequest mutation (status REQUESTED, needs merchant
+// approval in Shopify admin) rather than returnCreate (auto-open) - the
+// returns/request|approve|decline|close webhooks below keep the local
+// status in sync as the merchant processes it.
+exports.requestOrderReturn = catchAsync(async (req, res, next) => {
+   const { customerId, orderId } = req.params;
+   const cId = Number(customerId);
+   const requestedLineItems = req.body?.line_items;
+
+   if (isNaN(cId)) {
+      return res.status(400).json({ status: 'fail', message: 'Invalid customer ID' });
+   }
+   if (!Array.isArray(requestedLineItems) || requestedLineItems.length === 0) {
+      return res.status(400).json({ status: 'fail', message: 'line_items is required' });
+   }
+
+   const order = await Order.findOne({ "customer.id": cId, order_id: orderId });
+   if (!order) {
+      return next(new NotFoundError("Order not found or access denied"));
+   }
+
+   // Enrich against the order's own line items (already resolved from
+   // Shopify metafields at order-sync time) - same approach as
+   // refundOrderWebhook - and build Shopify's ReturnLineItemInput shape.
+   const shopifyReturnLineItems = [];
+   const localReturnLineItems = [];
+   for (const requested of requestedLineItems) {
+      const orderLineItem = order.line_items.find(
+         li => String(li.fulfillment_item_id) === String(requested.fulfillment_line_item_id)
+      );
+      shopifyReturnLineItems.push({
+         fulfillmentLineItemId: `gid://shopify/FulfillmentLineItem/${requested.fulfillment_line_item_id}`,
+         quantity: requested.quantity,
+         returnReason: requested.return_reason || 'OTHER',
+         returnReasonNote: requested.return_reason_note || null
+      });
+      localReturnLineItems.push({
+         fulfillment_line_item_id: String(requested.fulfillment_line_item_id ?? ''),
+         line_item_id: orderLineItem?.id || null,
+         quantity: requested.quantity,
+         title: orderLineItem?.title || null,
+         sku: orderLineItem?.sku || null,
+         vendor_id: orderLineItem?.vendor_id || null,
+         vendor_name: orderLineItem?.vendor_name || null,
+         return_reason: requested.return_reason || 'OTHER',
+         return_reason_note: requested.return_reason_note || null
+      });
+   }
+
+   const { data } = await shopifyGraphql.post("", {
+      query: RETURN_REQUEST_MUTATION,
+      variables: {
+         input: {
+            orderId: `gid://shopify/Order/${order.order_id}`,
+            returnLineItems: shopifyReturnLineItems
+         }
+      }
+   });
+
+   const returnErrors = data?.data?.returnRequest?.userErrors;
+   if (returnErrors?.length) {
+      return res.status(400).json({
+         status: "fail",
+         message: "Shopify rejected the return request",
+         errors: returnErrors
+      });
+   }
+
+   const shopifyReturn = data?.data?.returnRequest?.return;
+   order.returns.push({
+      return_id: shopifyReturn?.id || null,
+      name: shopifyReturn?.name || null,
+      status: shopifyReturn?.status || 'REQUESTED',
+      requested_at: shopifyReturn?.createdAt || new Date(),
+      line_items: localReturnLineItems
+   });
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Return Requested',
+      changes: { return_id: shopifyReturn?.id, line_items: localReturnLineItems },
+      message: `Return ${shopifyReturn?.name || ''} requested`.trim()
+   });
+
+   res.status(200).json({
+      status: "success",
+      message: "Return requested",
+      data: { return_id: shopifyReturn?.id, name: shopifyReturn?.name, status: shopifyReturn?.status || 'REQUESTED' }
+   });
+});
+
+// Mobile app: customer re-orders a past order. Shopify has no dedicated
+// "reorder" mutation - draftOrderCreateFromOrder duplicates the past order's
+// line items/discounts/shipping into a new Draft Order, and we hand the
+// customer its invoiceUrl (Shopify-hosted checkout) to actually pay. No
+// payment details are stored/replayed here; the resulting real order
+// appears via the existing orders/create webhook once they complete
+// checkout, and shows up in GET /orders/customer/:customerId on its own.
+exports.reorderCustomerOrder = catchAsync(async (req, res, next) => {
+   const { customerId, orderId } = req.params;
+   const cId = Number(customerId);
+
+   if (isNaN(cId)) {
+      return res.status(400).json({ status: 'fail', message: 'Invalid customer ID' });
+   }
+
+   const order = await Order.findOne({ "customer.id": cId, order_id: orderId });
+   if (!order) {
+      return next(new NotFoundError("Order not found or access denied"));
+   }
+
+   const { data } = await shopifyGraphql.post("", {
+      query: DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION,
+      variables: { orderId: `gid://shopify/Order/${order.order_id}` }
+   });
+
+   const draftErrors = data?.data?.draftOrderCreateFromOrder?.userErrors;
+   if (draftErrors?.length) {
+      return res.status(400).json({
+         status: "fail",
+         message: "Shopify couldn't recreate this order",
+         errors: draftErrors
+      });
+   }
+
+   const draftOrder = data?.data?.draftOrderCreateFromOrder?.draftOrder;
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Reorder Requested',
+      changes: { draft_order_id: draftOrder?.id },
+      message: `Reorder draft ${draftOrder?.name || ''} created`.trim()
+   });
+
+   res.status(200).json({
+      status: "success",
+      message: "Draft order created for reorder",
+      data: {
+         draft_order_id: draftOrder?.id,
+         name: draftOrder?.name,
+         invoice_url: draftOrder?.invoiceUrl,
+         status: draftOrder?.status
       }
    });
 });
@@ -383,12 +538,43 @@ exports.updateOrder = catchAsync(async (req, res, next) => {
 });
 
 //Cancell order
+// OrderCancelReason enum, confirmed against the live store schema.
+const VALID_CANCEL_REASONS = ['CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'STAFF', 'OTHER'];
+
 exports.cancelOrder = catchAsync(async (req, res, next) => {
    const orderCancelPayload = req.body;
    const order = await Order.findOne({ order_id: orderCancelPayload.id });
    if (!order) throw new NotFoundError("Order not found");
 
    const user = await User.findById(req.user.id);
+
+   // Actually cancel the order in Shopify first - previously this endpoint
+   // only ever updated the local Mongo record, so the "cancelled" status
+   // shown here never matched the live Shopify order (inventory wasn't
+   // restocked, Shopify-side reporting stayed wrong). Cancellation is
+   // asynchronous on Shopify's side; the existing orders/updated webhook
+   // (routed to createOrder) reconciles financial/fulfillment status once
+   // Shopify's job finishes - no need to poll it here.
+   const reason = VALID_CANCEL_REASONS.includes(orderCancelPayload.reason) ? orderCancelPayload.reason : 'OTHER';
+   const { data: cancelData } = await shopifyGraphql.post("", {
+      query: ORDER_CANCEL_MUTATION,
+      variables: {
+         orderId: `gid://shopify/Order/${order.order_id}`,
+         reason,
+         restock: !!orderCancelPayload.restock,
+         notifyCustomer: !!orderCancelPayload.notify_customer,
+         staffNote: orderCancelPayload?.cancel_reason || null
+      }
+   });
+
+   const cancelErrors = cancelData?.data?.orderCancel?.orderCancelUserErrors;
+   if (cancelErrors?.length) {
+      return res.status(400).json({
+         status: "fail",
+         message: "Shopify rejected the cancellation",
+         errors: cancelErrors
+      });
+   }
 
    order.cancelled_at = orderCancelPayload?.cancelled_at || new Date();
    order.cancel_reason = orderCancelPayload?.cancel_reason;
@@ -709,6 +895,177 @@ exports.pickupOrder = catchAsync(async (req, res, next) => {
       }
    });
 });
+
+// Shopify `refunds/create` webhook receiver — public, no JWT, same as the
+// order-create and product-delete receivers (Shopify webhook calls carry no
+// bearer token). TODO: verify X-Shopify-Hmac-Sha256 instead of relying on
+// obscurity, once a webhook signing secret is available (same gap noted on
+// the product-delete receiver).
+exports.refundOrderWebhook = catchAsync(async (req, res, next) => {
+   const refund = req.body;
+   const order_id = String(refund.order_id ?? '');
+
+   const order = await Order.findOne({ order_id });
+   if (!order) {
+      // Shopify still expects a 200 or it will keep retrying the webhook.
+      console.error(`Refund webhook: order ${order_id} not found`);
+      return res.status(200).json({ status: "success", message: "order not found, ignored" });
+   }
+
+   const refund_id = String(refund.id ?? '');
+
+   // Idempotency: Shopify may redeliver the same webhook.
+   if (order.refunds?.some(r => r.refund_id === refund_id)) {
+      return res.status(200).json({ status: "success", message: "refund already recorded" });
+   }
+
+   const amount = (refund.transactions || [])
+      .reduce((sum, txn) => sum + (parseFloat(txn.amount) || 0), 0);
+
+   const refundLineItems = (refund.refund_line_items || []).map(rli => {
+      // Enrich with vendor info from the order's own line items, already
+      // resolved from Shopify metafields at order-create time - avoids an
+      // extra Shopify API round trip here.
+      const orderLineItem = order.line_items.find(
+         li => String(li.id) === String(rli.line_item_id)
+      );
+      return {
+         line_item_id: String(rli.line_item_id ?? ''),
+         quantity: rli.quantity || 0,
+         title: rli.line_item?.title || orderLineItem?.title || null,
+         sku: rli.line_item?.sku || orderLineItem?.sku || null,
+         vendor_id: orderLineItem?.vendor_id || null,
+         vendor_name: rli.line_item?.vendor || orderLineItem?.vendor_name || null,
+         restock_type: rli.restock_type || null,
+         subtotal: parseFloat(rli.subtotal) || 0,
+         total_tax: parseFloat(rli.total_tax) || 0
+      };
+   });
+
+   order.refunds.push({
+      refund_id,
+      created_at: refund.created_at || new Date(),
+      note: refund.note || null,
+      restock: !!refund.restock,
+      amount,
+      line_items: refundLineItems
+   });
+   order.total_refunded = (order.refunds || []).reduce((sum, r) => sum + (r.amount || 0), 0);
+
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id,
+      action: 'Refunded',
+      changes: { refund_id, amount, line_items: refundLineItems },
+      message: amount
+         ? `Refund of ${amount} ${order.currency || ''} processed`.trim()
+         : 'Refund processed'
+   });
+
+   res.status(200).json({ status: "success", message: "refund recorded", data: { order_id, refund_id, amount } });
+});
+
+// Shopify Return webhooks (returns/request, returns/approve, returns/decline,
+// returns/close) - public, no JWT, same pattern/caveat as refundOrderWebhook
+// above. NOTE: the exact payload field names below (admin_graphql_api_id,
+// order_id, status, name) should be confirmed against a real Shopify test
+// webhook delivery before relying on this in production - Shopify's Returns
+// webhook payloads are less documented than the long-standing REST ones.
+const findOrderByReturn = async (payload) => {
+   const returnGid = payload.admin_graphql_api_id
+      || (payload.id ? `gid://shopify/Return/${payload.id}` : null);
+   if (returnGid) {
+      const order = await Order.findOne({ "returns.return_id": returnGid });
+      if (order) return { order, returnGid };
+   }
+   if (payload.order_id) {
+      const order = await Order.findOne({ order_id: String(payload.order_id) });
+      if (order) return { order, returnGid };
+   }
+   return { order: null, returnGid };
+};
+
+// returns/request - included in addition to approve/decline/close as a
+// defensive catch-all: a return can also be created directly in Shopify
+// admin/POS/storefront, bypassing our own requestOrderReturn endpoint. If we
+// already recorded it ourselves (return_id already present), leave it alone
+// instead of duplicating.
+exports.returnRequestedWebhook = catchAsync(async (req, res, next) => {
+   const payload = req.body;
+   const { order, returnGid } = await findOrderByReturn(payload);
+   if (!order) {
+      console.error(`Return-requested webhook: order for return ${returnGid} not found`);
+      return res.status(200).json({ status: "success", message: "order not found, ignored" });
+   }
+
+   if (order.returns.some(r => r.return_id === returnGid)) {
+      return res.status(200).json({ status: "success", message: "return already recorded" });
+   }
+
+   order.returns.push({
+      return_id: returnGid,
+      name: payload.name || null,
+      status: 'REQUESTED',
+      requested_at: payload.created_at || new Date(),
+      line_items: []
+   });
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action: 'Return Requested',
+      changes: { return_id: returnGid },
+      message: `Return ${payload.name || ''} requested (via Shopify)`.trim()
+   });
+
+   res.status(200).json({ status: "success", message: "return recorded" });
+});
+
+// Shared status-transition handler for returns/approve, returns/decline and
+// returns/close - each just maps to a different local status/timeline action.
+const handleReturnStatusWebhook = async (req, res, { status, closesReturn, action, verb }) => {
+   const payload = req.body;
+   const { order, returnGid } = await findOrderByReturn(payload);
+   if (!order) {
+      console.error(`Return-${verb} webhook: order for return ${returnGid} not found`);
+      return res.status(200).json({ status: "success", message: "order not found, ignored" });
+   }
+
+   const returnEntry = order.returns.find(r => r.return_id === returnGid);
+   if (!returnEntry) {
+      console.error(`Return-${verb} webhook: return ${returnGid} not found on order ${order.order_id}`);
+      return res.status(200).json({ status: "success", message: "return not found, ignored" });
+   }
+   if (returnEntry.status === status) {
+      return res.status(200).json({ status: "success", message: "already up to date" });
+   }
+
+   returnEntry.status = status;
+   if (closesReturn) returnEntry.closed_at = payload.closed_at || new Date();
+   await order.save();
+
+   await OrderTimeline.create({
+      order_id: order.order_id,
+      action,
+      changes: { return_id: returnGid, status },
+      message: `Return ${returnEntry.name || ''} ${verb}`.trim()
+   });
+
+   res.status(200).json({ status: "success", message: `return ${verb}` });
+};
+
+exports.returnApprovedWebhook = catchAsync(async (req, res, next) =>
+   handleReturnStatusWebhook(req, res, { status: 'OPEN', closesReturn: false, action: 'Return Approved', verb: 'approved' })
+);
+
+exports.returnDeclinedWebhook = catchAsync(async (req, res, next) =>
+   handleReturnStatusWebhook(req, res, { status: 'DECLINED', closesReturn: false, action: 'Return Declined', verb: 'declined' })
+);
+
+exports.returnClosedWebhook = catchAsync(async (req, res, next) =>
+   handleReturnStatusWebhook(req, res, { status: 'CLOSED', closesReturn: true, action: 'Return Closed', verb: 'closed' })
+);
 
 exports.deleteOrder = catchAsync(async(req,res,next)=>{
    const id = req.body.id

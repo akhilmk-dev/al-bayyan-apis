@@ -28,7 +28,7 @@ Express 5, Mongoose 8 (MongoDB Atlas), JWT auth (`jsonwebtoken` + `bcryptjs`), Z
 | `SHOPIFY_BASE_URL`, `SHOPIFY_TOKEN`, `SHOPIFY_ADMIN_API` | Shopify store integration | ✅ configured (real store) |
 | `GOOGLE_MAPS_API_KEY` | Geocodes customer addresses for live tracking | ❌ not yet supplied |
 | `ONESIGNAL_APP_ID`, `ONESIGNAL_REST_API_KEY` | Push notifications to delivery agents | ❌ not yet supplied |
-| `TRACKING_API_KEY` | Shared secret the customer-tracking app uses | ✅ generated — **must also be placed in the customer app's own `.env`**, it's not fetched from anywhere |
+| `TRACKING_API_KEY` | Shared secret the customer/mobile app uses — now gates live tracking **and** the return-request/reorder endpoints (see Feature 5), not just tracking | ✅ generated — **must also be placed in the customer app's own `.env`**, it's not fetched from anywhere |
 | `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | Sends delivery-confirmation OTP emails to customers | ❌ not yet supplied — OTP currently hardcoded to `5555` regardless (see below) |
 
 ## Core domain model
@@ -61,6 +61,27 @@ Marking an order `Delivered` now requires two steps — `updateDeliveryStatus` r
 1. `POST /agent/delivery-agent/orders/:id/request-delivery-otp` — generates an OTP, emails the customer via Brevo, order stays `Picked Up`. **Currently hardcoded to `5555`** (matches the existing forgot-password OTP convention, which is also a hardcoded `555555`) — swap for a real random generator once this is going to production with real customers, not just testing.
 2. `PUT /agent/delivery-agent/orders/:id/verify-delivery-otp` — only on a correct, unexpired OTP (1 minute validity) does the order actually get marked Delivered (Shopify fulfillment sync + earnings credit + live-location cleanup all happen here now, in a shared `completeDelivery()` helper in `deliveryAgentController.js`).
 - If `BREVO_API_KEY` isn't set, the email send is skipped and logged — the OTP flow still works end-to-end for testing (the response always echoes `Default: 5555` regardless, same transparency convention as the existing agent-password-reset OTP).
+
+### 5. Refunds, returns, real cancel-sync, and reorder (mobile app)
+- **Cancel now actually syncs to Shopify.** `POST /orders/cancel` used to only update the local Mongo record — Shopify's own order never got cancelled. It now calls Shopify's `orderCancel` GraphQL mutation first (`graphql/mutations/order.mutation.js`); a `400` with Shopify's error list is returned if Shopify rejects it (already cancelled, active return in progress, etc.), and the local record is only updated after Shopify accepts. Cancellation is async on Shopify's side — the existing `orders/updated` webhook reconciles final status once Shopify's job finishes.
+- **Refunds** (`Order.refunds`, append-only) are populated from the `refunds/create` webhook (`POST /orders/refund`, public/unauthenticated like every other Shopify webhook receiver in this repo).
+- **Returns** (`Order.returns`) — the mobile app can request a return via `POST /orders/customer/:customerId/:orderId/return` (protected by `TRACKING_API_KEY`, same as live tracking), which calls Shopify's `returnRequest` mutation (status `REQUESTED`, needs merchant approval in Shopify admin — not auto-opened). Status is kept in sync afterwards via four webhook receivers: `/orders/return-requested` (catch-all for returns created directly in Shopify, not just via the app), `/orders/return-approved` (→ status `OPEN`, Shopify has no separate "approved" status), `/orders/return-declined`, `/orders/return-closed`.
+- **Reorder** — `POST /orders/customer/:customerId/:orderId/reorder` (same `TRACKING_API_KEY` auth) calls Shopify's `draftOrderCreateFromOrder` mutation, which duplicates the past order into a new Draft Order, and returns its `invoiceUrl` for the customer to complete payment in a webview. No payment details are stored/replayed here — the resulting real order comes back through the existing `orders/create` webhook once they check out. There is no dedicated Shopify "reorder" webhook topic; a reorder is just an ordinary new order.
+- All enum values and mutation/field names above (`OrderCancelReason`, `ReturnReason`, `ReturnStatus`, `ReturnRequestInput`, `draftOrderCreateFromOrder`, etc.) were confirmed by introspecting the live store's schema at API version `2025-10` — not guessed from docs.
+- **Shopify webhook subscriptions that must be registered** (Admin → Settings → Notifications → Webhooks, or via the Admin API) — this is a dashboard step, nothing in this repo sends these:
+
+  | Topic | Endpoint | Status |
+  |---|---|---|
+  | `orders/create` | `/api/V1/orders/` | Should already exist (pre-dates this feature) — confirm it's actually subscribed. |
+  | `orders/updated` | `/api/V1/orders/` | Same receiver as above — confirm this topic is also subscribed, not just `orders/create`. |
+  | `refunds/create` | `/api/V1/orders/refund` | **New — needs registering.** |
+  | `returns/request` | `/api/V1/orders/return-requested` | **New — needs registering.** |
+  | `returns/approve` | `/api/V1/orders/return-approved` | **New — needs registering.** |
+  | `returns/decline` | `/api/V1/orders/return-declined` | **New — needs registering.** |
+  | `returns/close` | `/api/V1/orders/return-closed` | **New — needs registering.** |
+
+  Not built: `returns/cancel` and `returns/reopen` (same pattern, only worth adding if actually needed — don't register these topics without also building their receivers, or Shopify will 404 and eventually auto-disable the webhook).
+- **Known gap**: none of the webhook receivers verify Shopify's `X-Shopify-Hmac-Sha256` signature yet — same pre-existing TODO as `/products/product-delete`, just relying on the URL being obscure for now.
 
 ## Known bugs fixed during this engagement (worth knowing about, not re-introducing)
 
