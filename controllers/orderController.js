@@ -13,6 +13,7 @@ const shopifyGraphql = require('../utils/shopifyGraphql');
 const { ORDER_CANCEL_MUTATION, RETURN_REQUEST_MUTATION, RETURN_APPROVE_MUTATION, RETURN_DECLINE_MUTATION, REFUND_CREATE_MUTATION, RETURN_CLOSE_MUTATION, DRAFT_ORDER_CREATE_FROM_ORDER_MUTATION } = require('../graphql/mutations/order.mutation');
 const { ORDER_FULFILLMENT_LINE_ITEMS_QUERY, SUGGESTED_REFUND_QUERY } = require('../graphql/queries/order.query');
 const notifyCustomerStatus = require('../utils/notifyCustomerStatus');
+const { generateInvoicePdf } = require('../utils/generateInvoicePdf');
 
 // get all orders
 // Simple top-level fields for the mobile app, on top of the full `returns`/
@@ -575,6 +576,30 @@ exports.reorderCustomerOrder = catchAsync(async (req, res, next) => {
          status: draftOrder?.status
       }
    });
+});
+
+// Mobile app: customer downloads a PDF invoice for their own order. Auth is
+// the same shared static API key as live tracking - ownership is checked by
+// matching customerId/orderId, same as getOrderDetailByCustomer.
+exports.getOrderInvoice = catchAsync(async (req, res, next) => {
+   const { customerId, orderId } = req.params;
+   const cId = Number(customerId);
+
+   if (isNaN(cId)) {
+      return res.status(400).json({ status: 'fail', message: 'Invalid customer ID' });
+   }
+
+   const order = await Order.findOne({ "customer.id": cId, order_id: orderId }).lean();
+   if (!order) {
+      return next(new NotFoundError("Order not found or access denied"));
+   }
+
+   res.setHeader('Content-Type', 'application/pdf');
+   res.setHeader('Content-Disposition', `attachment; filename="invoice-${order.order_number || order.order_id}.pdf"`);
+
+   const doc = generateInvoicePdf(order);
+   doc.pipe(res);
+   doc.end();
 });
 
 // Live order tracking for the external customer app. Auth is a shared static

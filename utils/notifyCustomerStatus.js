@@ -2,10 +2,8 @@ const { sendCustomerNotification } = require('./sendNotification');
 
 // Notifies the customer's mobile app when their order reaches one of these
 // milestones. Deep-link scheme uses the customer app's bundle ID
-// (com.albayan) - mirrors the staff app's com.albayan_staffapp://OrderDetail/
-// convention, but the exact screen/route name (`OrderDetail`) is a guess
-// based on that convention, not confirmed against the actual customer app's
-// navigation - confirm/adjust with whoever owns that codebase.
+// (com.albayan) - screen/route name is `OrderHistory`, confirmed against the
+// actual customer app's navigation.
 const STATUS_COPY = {
   'Picked Up': {
     title: 'Order picked up 🛵',
@@ -31,7 +29,7 @@ const notifyCustomerStatus = async (order, status) => {
     copy.title,
     copy.message(order),
     { id: order._id.toString(), order_id: order.order_id, type: 'order_status', status },
-    `com.albayan://OrderDetail/${order._id.toString()}`
+    `com.albayan://OrderHistory/${order._id.toString()}`
   );
 };
 

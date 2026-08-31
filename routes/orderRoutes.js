@@ -1,5 +1,5 @@
 const express = require('express');
-const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, refundOrderWebhook, requestOrderReturn, adminRequestOrderReturn, adminApproveReturn, adminDeclineReturn, adminProcessReturnRefund, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
+const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, getOrderInvoice, refundOrderWebhook, requestOrderReturn, adminRequestOrderReturn, adminApproveReturn, adminDeclineReturn, adminProcessReturnRefund, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
 const { authenticate } = require('../middleware/authMiddleware');
 const { requirePermission } = require('../middleware/permissionMiddleware');
 const { requireTrackingApiKey } = require('../middleware/trackingAuthMiddleware');
@@ -19,6 +19,7 @@ router.get('/track/:orderId', requireTrackingApiKey, getOrderTracking);
 // mobile app: return request + reorder (same shared API key as tracking above)
 router.post('/customer/:customerId/:orderId/return', requireTrackingApiKey, requestOrderReturn);
 router.post('/customer/:customerId/:orderId/reorder', requireTrackingApiKey, reorderCustomerOrder);
+router.get('/customer/:customerId/:orderId/invoice', requireTrackingApiKey, getOrderInvoice);
 // Shopify webhook receivers for the return lifecycle - public, no bearer JWT,
 // same pattern as /refund above.
 router.post('/return-requested', returnRequestedWebhook);
