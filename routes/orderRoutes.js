@@ -1,5 +1,6 @@
 const express = require('express');
 const { getOrders, createOrder, getOrderByVendor, updateOrder, cancelOrder, getOrderById, markAsPaid, fulfilOrder, fulfillSingleItem, deleteOrder, getOrdersByCustomer, getOrderDetailByCustomer, pickupOrder, getOrderTracking, getOrderInvoice, refundOrderWebhook, requestOrderReturn, adminRequestOrderReturn, adminApproveReturn, adminDeclineReturn, adminProcessReturnRefund, reorderCustomerOrder, returnRequestedWebhook, returnApprovedWebhook, returnDeclinedWebhook, returnClosedWebhook } = require('../controllers/orderController');
+const { getCustomerNotifications, getCustomerUnreadCount, markCustomerNotificationsAsRead } = require('../controllers/notificationController');
 const { authenticate } = require('../middleware/authMiddleware');
 const { requirePermission } = require('../middleware/permissionMiddleware');
 const { requireTrackingApiKey } = require('../middleware/trackingAuthMiddleware');
@@ -13,6 +14,12 @@ router.post('/refund', refundOrderWebhook);
 router.get(`/:id`,authenticate,requirePermission('Order List'),getOrderByVendor);
 // customer orders
 router.get('/customer/:customerId',getOrdersByCustomer);
+// customer app: notification listing (same shared API key as tracking below).
+// Must be registered BEFORE the generic '/customer/:customerId/:orderId'
+// route, otherwise Express would match "notifications" as an :orderId value.
+router.get('/customer/:customerId/notifications', requireTrackingApiKey, getCustomerNotifications);
+router.get('/customer/:customerId/notifications/unread-count', requireTrackingApiKey, getCustomerUnreadCount);
+router.patch('/customer/:customerId/notifications/read', requireTrackingApiKey, markCustomerNotificationsAsRead);
 router.get('/customer/:customerId/:orderId',getOrderDetailByCustomer);
 // live tracking (external customer app, shared API key auth)
 router.get('/track/:orderId', requireTrackingApiKey, getOrderTracking);

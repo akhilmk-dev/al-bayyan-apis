@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const Order = require('../models/Order');
 const Settings = require('../models/Settings');
 const OrderTimeline = require('../models/OrderTimeline');
+const Notification = require('../models/Notification');
 const { sendNotification } = require('../utils/sendNotification');
 
 // Reminds an agent if an assignment has sat in 'pending_acceptance' longer
@@ -19,13 +20,24 @@ const checkStaleAssignments = async () => {
     });
 
     for (const order of staleOrders) {
+      const title = 'Order awaiting your response ⏰';
+      const message = `Order #${order.order_number || order.order_id} is still awaiting your acceptance.`;
+      const data = { id: order._id.toString(), order_id: order.order_id, type: 'assignment_reminder' };
+
       await sendNotification(
         order.assigned_agent.toString(),
-        'Order awaiting your response ⏰',
-        `Order #${order.order_number || order.order_id} is still awaiting your acceptance.`,
-        { id: order._id.toString(), order_id: order.order_id, type: 'assignment_reminder' },
+        title,
+        message,
+        data,
         `com.albayyan_staffapp://OrderDetail/${order._id.toString()}`
       );
+      await Notification.create({
+        agent_id: order.assigned_agent,
+        title,
+        message,
+        data,
+        is_read: false
+      });
       order.reminder_sent_at = new Date();
       await order.save();
       await OrderTimeline.create({

@@ -1,4 +1,5 @@
 const { sendCustomerNotification } = require('./sendNotification');
+const Notification = require('../models/Notification');
 
 // Notifies the customer's mobile app when their order reaches one of these
 // milestones. Deep-link scheme uses the customer app's bundle ID
@@ -24,13 +25,26 @@ const notifyCustomerStatus = async (order, status) => {
   const copy = STATUS_COPY[status];
   if (!copy) return;
 
+  const title = copy.title;
+  const message = copy.message(order);
+  const data = { id: order._id.toString(), order_id: order.order_id, type: 'order_status', status };
+
   await sendCustomerNotification(
     order.customer.id.toString(),
-    copy.title,
-    copy.message(order),
-    { id: order._id.toString(), order_id: order.order_id, type: 'order_status', status },
+    title,
+    message,
+    data,
     `com.albayan://OrderHistory/${order._id.toString()}`
   );
+
+  // Save notification to database, same as agent notifications
+  await Notification.create({
+    customer_id: order.customer.id,
+    title,
+    message,
+    data,
+    is_read: false
+  });
 };
 
 module.exports = notifyCustomerStatus;
