@@ -534,8 +534,16 @@ exports.getAssignedOrders = catchAsync(async (req, res, next) => {
 });
 
 // Get Order Detail
+// Accepts either the Mongo _id (what the app's deep links/notifications
+// correctly send) or the Shopify order_id, defensively - some app screens
+// have been observed passing the Shopify id instead, which used to crash
+// with a raw Mongoose CastError ("Cast to ObjectId failed...") since
+// findById() throws on a non-ObjectId string.
 exports.getOrderDetail = catchAsync(async (req, res, next) => {
-    const order = await Order.findById(req.params.id).lean();
+    const { id } = req.params;
+    const order = mongoose.Types.ObjectId.isValid(id)
+        ? await Order.findById(id).lean()
+        : await Order.findOne({ order_id: id }).lean();
     if (!order) throw new NotFoundError('Order not found');
 
     if (order.assigned_agent?.toString() !== req.user.id) {
