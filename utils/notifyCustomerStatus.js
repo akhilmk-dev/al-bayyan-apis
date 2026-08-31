@@ -27,14 +27,18 @@ const notifyCustomerStatus = async (order, status) => {
 
   const title = copy.title;
   const message = copy.message(order);
-  const data = { id: order._id.toString(), order_id: order.order_id, type: 'order_status', status };
+  // order_id (Shopify) - not the Mongo _id - is what the customer app's own
+  // detail/invoice/return/reorder endpoints all key on
+  // (GET /orders/customer/:customerId/:orderId etc.), so that's the id the
+  // deep link and payload need to carry for the app to fetch order details.
+  const data = { order_id: order.order_id, type: 'order_status', status };
 
   await sendCustomerNotification(
     order.customer.id.toString(),
     title,
     message,
     data,
-    `com.albayan://OrderHistory/${order._id.toString()}`
+    `com.albayan://OrderHistory/${order.order_id}`
   );
 
   // Save notification to database, same as agent notifications
