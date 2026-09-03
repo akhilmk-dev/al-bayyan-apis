@@ -66,17 +66,25 @@ exports.createAgent = catchAsync(async (req, res, next) => {
 });
 
 // Get All Agents
+// Optional ?status=active|inactive and ?is_online=true|false filters, e.g.
+// for an "available agents" picker (?status=active&is_online=true) when
+// assigning an order - defaults to no filter, returning every agent, same
+// as before these were added.
 exports.getAgents = catchAsync(async (req, res, next) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
 
-    const agents = await DeliveryAgent.find()
+    const query = {};
+    if (req.query.status) query.status = req.query.status;
+    if (req.query.is_online !== undefined) query.is_online = req.query.is_online === 'true';
+
+    const agents = await DeliveryAgent.find(query)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit);
 
-    const total = await DeliveryAgent.countDocuments();
+    const total = await DeliveryAgent.countDocuments(query);
 
     res.status(200).json({
         status: 'success',
@@ -474,7 +482,26 @@ exports.getDeliveryStats = catchAsync(async (req, res, next) => {
     });
 });
 
-// Get Earnings (today / this month / total deliveries)
+// Shared shape for a single earnings-history row, used by both getEarnings'
+// `recent` preview and getEarningsHistory's paginated list below.
+const mapEarning = (earning) => ({
+    _id: earning._id,
+    amount: earning.amount,
+    delivered_at: earning.delivered_at,
+    // order_id here is the populated Order doc (or null if the order was
+    // since deleted) - renamed to `order` in the response so it isn't
+    // confused with the Shopify order_id string nested inside it.
+    order: earning.order_id ? {
+        id: earning.order_id._id,
+        order_id: earning.order_id.order_id,
+        order_number: earning.order_id.order_number,
+        name: earning.order_id.name
+    } : null
+});
+
+// Get Earnings (today / this month / total deliveries + a short recent
+// preview - tap "View All" in the app to hit GET /earnings/history below for
+// the full paginated list).
 exports.getEarnings = catchAsync(async (req, res, next) => {
     const agentId = req.user.id;
 
@@ -496,13 +523,47 @@ exports.getEarnings = catchAsync(async (req, res, next) => {
     const month_earnings = await sumSince(monthStart);
     const total_deliveries = await AgentEarning.countDocuments({ agent_id: agentId });
 
+    const recentEarnings = await AgentEarning.find({ agent_id: agentId })
+        .sort({ delivered_at: -1 })
+        .limit(5)
+        .populate('order_id', 'order_id order_number name')
+        .lean();
+
     res.status(200).json({
         status: 'success',
         data: {
             today_earnings,
             month_earnings,
-            total_deliveries
+            total_deliveries,
+            recent: recentEarnings.map(mapEarning)
         }
+    });
+});
+
+// Get Earnings History - per-order breakdown behind the aggregate numbers
+// above, paginated, most recent delivery first. Backs the app's "View All"
+// screen off the earnings summary above.
+exports.getEarningsHistory = catchAsync(async (req, res, next) => {
+    const agentId = req.user.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 15;
+    const skip = (page - 1) * limit;
+
+    const earnings = await AgentEarning.find({ agent_id: agentId })
+        .sort({ delivered_at: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('order_id', 'order_id order_number name')
+        .lean();
+
+    const total = await AgentEarning.countDocuments({ agent_id: agentId });
+
+    res.status(200).json({
+        status: 'success',
+        total,
+        page,
+        limit,
+        data: earnings.map(mapEarning)
     });
 });
 
@@ -937,6 +998,30 @@ exports.getProfile = catchAsync(async (req, res, next) => {
             ...formatAgent(req, agent),
             total_delivered_count
         }
+    });
+});
+
+// Agent toggles their own online/offline availability ("go online"/"go
+// offline" in the app) - separate from the admin-controlled active/inactive
+// account status. Used to filter down to available agents elsewhere
+// (see getAgents' is_online query param below).
+exports.updateOnlineStatus = catchAsync(async (req, res, next) => {
+    const { is_online } = req.body;
+    if (typeof is_online !== 'boolean') {
+        return res.status(400).json({ status: 'fail', message: 'is_online (boolean) is required' });
+    }
+
+    const agent = await DeliveryAgent.findByIdAndUpdate(
+        req.user.id,
+        { is_online },
+        { new: true }
+    );
+    if (!agent) throw new NotFoundError('Agent not found');
+
+    res.status(200).json({
+        status: 'success',
+        message: `You are now ${is_online ? 'online' : 'offline'}`,
+        data: { is_online: agent.is_online }
     });
 });
 

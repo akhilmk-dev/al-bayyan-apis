@@ -185,6 +185,11 @@ paths:
       tags:
         - Delivery Agent (Admin)
       summary: Get all delivery agents (Paginated)
+      description: >
+        No filters applied by default (returns every agent regardless of
+        status). Pass status and/or is_online to narrow down to available
+        agents for an assignment picker, e.g.
+        ?status=active&is_online=true.
       security:
         - bearerAuth: []
       parameters:
@@ -197,6 +202,14 @@ paths:
         - name: search
           in: query
           schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, inactive] }
+          description: Admin-controlled account enable/disable filter
+        - name: is_online
+          in: query
+          schema: { type: boolean }
+          description: Agent-controlled online/offline filter (set via the agent app's PATCH /agent/delivery-agent/online-status)
       responses:
         '200':
           description: List of agents fetched successfully
@@ -499,6 +512,99 @@ paths:
                             delivered_at: { type: string, format: date-time }
                             total_price: { type: number }
                             shipping_address: { type: object }
+
+  /api/V1/agent/delivery-agent/earnings:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get earnings summary (today / this month / total deliveries + a short recent preview)
+      description: >
+        Aggregate figures computed from the AgentEarning ledger (one entry
+        per delivered order, created in completeDelivery using the
+        admin-configurable Settings.delivery_earning_rate), plus the 5 most
+        recent entries as a preview. Boundaries are computed in UTC. Tap
+        "View All" in the app to hit GET /earnings/history below for the
+        full paginated list.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Earnings summary fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  data:
+                    type: object
+                    properties:
+                      today_earnings: { type: number }
+                      month_earnings: { type: number }
+                      total_deliveries: { type: integer }
+                      recent:
+                        type: array
+                        description: 5 most recent earnings entries, same shape as GET /earnings/history's `data` items
+                        items:
+                          type: object
+                          properties:
+                            _id: { type: string }
+                            amount: { type: number }
+                            delivered_at: { type: string, format: date-time }
+                            order:
+                              type: object
+                              nullable: true
+                              properties:
+                                id: { type: string }
+                                order_id: { type: string }
+                                order_number: { type: string }
+                                name: { type: string, example: "#1012" }
+
+  /api/V1/agent/delivery-agent/earnings/history:
+    get:
+      tags:
+        - Delivery Agent (App)
+      summary: Get per-order earnings history (payment history), paginated
+      description: >
+        One entry per delivered order, most recent first, with the order's
+        Shopify order_id/order_number/name populated for display.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 15 }
+      responses:
+        '200':
+          description: Earnings history fetched successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  total: { type: integer }
+                  page: { type: integer }
+                  limit: { type: integer }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id: { type: string }
+                        amount: { type: number }
+                        delivered_at: { type: string, format: date-time }
+                        order:
+                          type: object
+                          nullable: true
+                          properties:
+                            id: { type: string, description: Mongo _id of the order }
+                            order_id: { type: string, description: Shopify order id }
+                            order_number: { type: string }
+                            name: { type: string, example: "#1012" }
 
   /api/V1/agent/delivery-agent/assigned-orders:
     get:
@@ -803,11 +909,49 @@ paths:
                       email: { type: string }
                       mobile: { type: string }
                       vehicle_type: { type: string }
-                      status: { type: string }
+                      status: { type: string, description: Admin-controlled account enable/disable status }
+                      is_online: { type: boolean, description: Agent-controlled online/offline toggle }
                       avatar: { type: string, nullable: true }
                       createdAt: { type: string, format: date-time }
                       updatedAt: { type: string, format: date-time }
-  
+
+  /api/V1/agent/delivery-agent/online-status:
+    patch:
+      tags:
+        - Delivery Agent (App)
+      summary: Go online / go offline
+      description: >
+        Agent-controlled availability toggle, separate from the admin's
+        active/inactive account status. Used to filter "available agents"
+        elsewhere, e.g. GET /admin/delivery-agent/list?is_online=true.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_online]
+              properties:
+                is_online: { type: boolean }
+      responses:
+        '200':
+          description: Online status updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: success }
+                  message: { type: string, example: You are now online }
+                  data:
+                    type: object
+                    properties:
+                      is_online: { type: boolean }
+        '400':
+          description: is_online (boolean) is required
+
   /api/V1/agent/delivery-agent/notifications:
     get:
       tags:

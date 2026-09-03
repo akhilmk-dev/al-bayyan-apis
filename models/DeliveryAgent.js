@@ -16,7 +16,13 @@ const deliveryAgentSchema = new mongoose.Schema({
     required: [true, "Vehicle type is required"],
     enum: ['bike', 'car', 'van', 'other']
   },
+  // Admin-controlled account enable/disable flag - distinct from is_online
+  // below, which the agent controls themselves from the app.
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+  // Agent-controlled online/offline toggle ("go online"/"go offline" in the
+  // app) - used to filter down to currently-available agents, separate from
+  // the admin's active/inactive account status above.
+  is_online: { type: Boolean, default: false },
   avatar: { type: String },
   otp: { type: Number },
   otp_expiry: { type: Date },
