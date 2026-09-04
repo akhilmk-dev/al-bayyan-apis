@@ -51,11 +51,15 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
     if (!user || user.refresh_token !== refreshToken) {
       return res.status(403).json({ status: 'error', message: 'Forbidden' });
     }
+    // Only reissue the access token - the refresh token itself is NOT
+    // rotated here. Rotating on every call caused concurrent/parallel
+    // refresh requests (e.g. several widgets 401'ing around the same time)
+    // to race: the first rotates and saves a new refresh_token, then every
+    // other in-flight request's still-valid-by-expiry old token no longer
+    // matches, so it gets rejected with 403 and the client force-logs-out.
+    // The refresh token stays valid until its own expiry or a fresh login.
     const newAccessToken = generateAccessToken(user);
-    const newRefreshToken = generateRefreshToken(user);
-    user.refresh_token = newRefreshToken;
-    await user.save();
-    res.json({ status: 'success', accessToken: newAccessToken, refreshToken: newRefreshToken });
+    res.json({ status: 'success', accessToken: newAccessToken, refreshToken });
   } catch (err) {
     return res.status(401).json({ status: 'error', message: 'Invalid refresh token' });
   }
