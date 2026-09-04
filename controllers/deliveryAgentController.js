@@ -205,6 +205,10 @@ exports.assignAgentToOrder = catchAsync(async (req, res, next) => {
     const agent = await DeliveryAgent.findById(agent_id);
     if (!agent) throw new NotFoundError('Agent not found');
 
+    if (!agent.is_online) {
+        return res.status(400).json({ status: 'error', message: 'This agent is offline and cannot be assigned an order' });
+    }
+
     const alreadyRejected = order.rejected_agents?.some(r => r.agent_id?.toString() === agent_id);
     if (alreadyRejected) {
         return res.status(400).json({ status: 'error', message: 'This agent already rejected this order and cannot be reassigned to it' });
@@ -267,7 +271,7 @@ exports.loginAgent = catchAsync(async (req, res, next) => {
     }
 
     const query = email ? { email } : { mobile };
-    const agent = await DeliveryAgent.findOne(query);
+    const agent = await DeliveryAgent.findOne(query).select('+password');
 
     if (!agent || !(await agent.comparePassword(password))) {
         return res.status(401).json({ status: 'error', message: 'Invalid credentials' });
@@ -289,10 +293,7 @@ exports.loginAgent = catchAsync(async (req, res, next) => {
         message: 'Login successful',
         accessToken,
         refreshToken,
-        data: {
-            ...agent.toObject(),
-            avatar: getFullUrl(req, agent.avatar)
-        }
+        data: formatAgent(req, agent)
     });
 });
 
@@ -304,7 +305,7 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
     }
     try {
         const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-        const agent = await DeliveryAgent.findById(decoded.id);
+        const agent = await DeliveryAgent.findById(decoded.id).select('+refresh_token');
         if (!agent || agent.refresh_token !== refreshToken) {
             return res.status(403).json({ status: 'error', message: 'Forbidden' });
         }
@@ -1009,8 +1010,14 @@ exports.rejectOrder = catchAsync(async (req, res, next) => {
 const formatAgent = (req, agent) => {
     if (!agent) return null;
     const agentObj = typeof agent.toObject === 'function' ? agent.toObject() : agent;
+    // password/refresh_token/otp/otp_expiry are select: false on the schema
+    // so a normal query already excludes them, but some call sites (login,
+    // changePasswordAgent) explicitly re-select password to verify it - this
+    // strips them again here regardless, so formatAgent is always safe to
+    // send straight back to a client.
+    const { password, refresh_token, otp, otp_expiry, ...safeAgent } = agentObj;
     return {
-        ...agentObj,
+        ...safeAgent,
         avatar: getFullUrl(req, agentObj.avatar)
     };
 };

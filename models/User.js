@@ -3,7 +3,10 @@ const mongoose = require('mongoose');
 const userSchema = new mongoose.Schema({
   name: { type: String, required: [true, "name is required"] },
   email: { type: String, required: [true, "email is required"], unique: true },
-  password: { type: String, required: [true, "password is required"] },
+  // select: false - never returned by a normal query, so it can't leak
+  // through login/profile/list responses. Fetch it explicitly with
+  // .select('+password') only where actually needed - login.
+  password: { type: String, required: [true, "password is required"], select: false },
   mobile: { type: String, required: [true, "mobile number is required"] },
   whatsapp_number: {type: String, required:[true,"whatsapp number is required"]},
   role: {
@@ -23,7 +26,7 @@ const userSchema = new mongoose.Schema({
   account_name: String,
   account_number: String,
   iban: String,
-  refresh_token: String
+  refresh_token: { type: String, select: false }
 }, { timestamps: true });
 
 userSchema.pre('validate', async function (next) {

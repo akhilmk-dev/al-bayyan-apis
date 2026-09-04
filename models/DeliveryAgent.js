@@ -10,7 +10,11 @@ const deliveryAgentSchema = new mongoose.Schema({
     unique: true,
     match: [/^\d{10}$/, "Mobile number must be exactly 10 digits"]
   },
-  password: { type: String, required: [true, "Password is required"] },
+  // select: false - never returned by a normal query/toObject(), so it can't
+  // leak through profile/list/details responses (formatAgent etc. spread the
+  // whole document). Fetch it explicitly with .select('+password') only
+  // where actually needed - login, changePasswordAgent.
+  password: { type: String, required: [true, "Password is required"], select: false },
   vehicle_type: { 
     type: String, 
     required: [true, "Vehicle type is required"],
@@ -24,11 +28,13 @@ const deliveryAgentSchema = new mongoose.Schema({
   // the admin's active/inactive account status above.
   is_online: { type: Boolean, default: false },
   avatar: { type: String },
-  otp: { type: Number },
-  otp_expiry: { type: Date },
+  // select: false on the internal/sensitive fields below too - none of these
+  // are meant to ever be returned to a client.
+  otp: { type: Number, select: false },
+  otp_expiry: { type: Date, select: false },
   is_verified: { type: Boolean, default: false },
   otp_method: { type: String, enum: ['email', 'mobile'], default: null },
-  refresh_token: { type: String }
+  refresh_token: { type: String, select: false }
 }, { timestamps: true });
 
 // Hash password before saving

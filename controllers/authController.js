@@ -8,16 +8,21 @@ const { InternalServerError, EmptyRequestBodyError, UnAuthorizedError } = requir
 exports.login = catchAsync(async (req, res, next) => {
   const { email, password } = req.body;
  
-   // Populate role and nested permissions
+   // Populate role and nested permissions. +password is required here to
+   // verify credentials below - password/refresh_token are select: false by
+   // default (never returned by a normal query) specifically so they can't
+   // leak through responses like this one, so they're explicitly stripped
+   // again before the user object goes out in the response.
    const user = await User.findOne({ email })
+     .select('+password')
      .populate({
        path: 'role',
        populate: {
          path: 'permissions',
-         select: 'permission_name page_url group _id' 
+         select: 'permission_name page_url group _id'
        }
    });
- 
+
     if (!user) throw new UnAuthorizedError("Invalid credentials");
 
     const isMatch = await bcrypt.compare(password, user.password);
@@ -31,12 +36,16 @@ exports.login = catchAsync(async (req, res, next) => {
 
   const permissions = user.role?.permissions || [];
 
+  const safeUser = user.toObject();
+  delete safeUser.password;
+  delete safeUser.refresh_token;
+
   res.json({
     status: 'success',
     message:"Login Successfull!",
     accessToken,
     refreshToken,
-    user,
+    user: safeUser,
     permissions
   });
 });
@@ -47,7 +56,7 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
   const { refreshToken } = req.body;
   try {
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-    const user = await User.findById(decoded.id);
+    const user = await User.findById(decoded.id).select('+refresh_token');
     if (!user || user.refresh_token !== refreshToken) {
       return res.status(403).json({ status: 'error', message: 'Forbidden' });
     }

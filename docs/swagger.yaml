@@ -303,7 +303,7 @@ paths:
         '200':
           description: Agent assigned to order successfully. Sets assignment_status to pending_acceptance - the agent must accept or reject it via the app.
         '400':
-          description: Order already fulfilled, or this agent previously rejected this order
+          description: Order already fulfilled, agent is offline (is_online is false), or this agent previously rejected this order
 
   # --- Delivery Agent Mobile App APIs ---
   /api/V1/agent/delivery-agent/login:
