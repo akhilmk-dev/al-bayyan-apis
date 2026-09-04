@@ -542,21 +542,49 @@ exports.getEarnings = catchAsync(async (req, res, next) => {
 
 // Get Earnings History - per-order breakdown behind the aggregate numbers
 // above, paginated, most recent delivery first. Backs the app's "View All"
-// screen off the earnings summary above.
+// screen off the earnings summary above. Optionally scoped to a whole
+// month/year (not an exact date) via ?month=&year= - same UTC-boundary
+// convention as today_earnings/month_earnings above.
 exports.getEarningsHistory = catchAsync(async (req, res, next) => {
     const agentId = req.user.id;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 15;
     const skip = (page - 1) * limit;
 
-    const earnings = await AgentEarning.find({ agent_id: agentId })
+    const query = { agent_id: agentId };
+
+    const { month, year } = req.query;
+    if (year !== undefined) {
+        const y = parseInt(year);
+        if (isNaN(y)) {
+            return res.status(400).json({ status: 'fail', message: 'Invalid year' });
+        }
+
+        let rangeStart, rangeEnd;
+        if (month !== undefined) {
+            const m = parseInt(month);
+            if (isNaN(m) || m < 1 || m > 12) {
+                return res.status(400).json({ status: 'fail', message: 'Invalid month (must be 1-12)' });
+            }
+            rangeStart = new Date(Date.UTC(y, m - 1, 1));
+            rangeEnd = new Date(Date.UTC(y, m, 1));
+        } else {
+            rangeStart = new Date(Date.UTC(y, 0, 1));
+            rangeEnd = new Date(Date.UTC(y + 1, 0, 1));
+        }
+        query.delivered_at = { $gte: rangeStart, $lt: rangeEnd };
+    } else if (month !== undefined) {
+        return res.status(400).json({ status: 'fail', message: 'year is required when filtering by month' });
+    }
+
+    const earnings = await AgentEarning.find(query)
         .sort({ delivered_at: -1 })
         .skip(skip)
         .limit(limit)
         .populate('order_id', 'order_id order_number name')
         .lean();
 
-    const total = await AgentEarning.countDocuments({ agent_id: agentId });
+    const total = await AgentEarning.countDocuments(query);
 
     res.status(200).json({
         status: 'success',

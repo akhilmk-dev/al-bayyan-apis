@@ -567,7 +567,11 @@ paths:
       summary: Get per-order earnings history (payment history), paginated
       description: >
         One entry per delivered order, most recent first, with the order's
-        Shopify order_id/order_number/name populated for display.
+        Shopify order_id/order_number/name populated for display. Optionally
+        scoped to a whole month/year (not an exact date) via month+year -
+        year alone filters the whole year, month requires year alongside it.
+        Boundaries computed in UTC, same convention as the earnings summary
+        endpoint's today_earnings/month_earnings.
       security:
         - bearerAuth: []
       parameters:
@@ -577,6 +581,14 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, default: 15 }
+        - name: year
+          in: query
+          schema: { type: integer, example: 2026 }
+          description: Filter to this year (optionally narrowed further by month below)
+        - name: month
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 12, example: 9 }
+          description: Filter to this month (1-12) - requires year to also be set
       responses:
         '200':
           description: Earnings history fetched successfully
@@ -605,6 +617,8 @@ paths:
                             order_id: { type: string, description: Shopify order id }
                             order_number: { type: string }
                             name: { type: string, example: "#1012" }
+        '400':
+          description: Invalid year, invalid month, or month passed without year
 
   /api/V1/agent/delivery-agent/assigned-orders:
     get:
