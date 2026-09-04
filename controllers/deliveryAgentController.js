@@ -42,10 +42,12 @@ exports.createAgent = catchAsync(async (req, res, next) => {
         res.status(201).json({
             status: 'success',
             message: 'Agent created successfully',
-            data: {
-                ...agent.toObject(),
-                avatar: getFullUrl(req, agent.avatar)
-            }
+            // formatAgent (not a raw agent.toObject() spread) - a freshly
+            // .create()'d document has every field in memory regardless of
+            // the schema's select:false on password/refresh_token/otp
+            // (select:false only affects query results, not new documents),
+            // so this would otherwise leak the just-hashed password.
+            data: formatAgent(req, agent)
         });
     } catch (err) {
         if (err.code === 11000) {
@@ -172,8 +174,42 @@ exports.updateAgent = catchAsync(async (req, res, next) => {
 
 // Delete Agent
 exports.deleteAgent = catchAsync(async (req, res, next) => {
-    const agent = await DeliveryAgent.findByIdAndDelete(req.params.id);
+    const { id } = req.params;
+    const agent = await DeliveryAgent.findById(id);
     if (!agent) throw new NotFoundError('Agent not found');
+
+    // Block deleting an agent who is currently working - a Pending
+    // assignment (awaiting accept/reject) or Picked Up (in transit) order
+    // pointing at this agent means they're actively engaged right now.
+    const activeOrder = await Order.findOne({
+        assigned_agent: id,
+        delivery_status: { $in: ['Pending', 'Picked Up'] }
+    });
+    if (activeOrder) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'This agent has an active delivery assignment and cannot be deleted. Wait until it is completed or cancelled, or set the agent to inactive instead.'
+        });
+    }
+
+    // Block deleting an agent with ANY historical dependency - hard-deleting
+    // would leave dangling ObjectId references in orders/earnings/
+    // notifications that still point at this agent. Set status to
+    // 'inactive' instead to preserve that history.
+    const [hasOrderHistory, hasRejectionHistory, hasEarnings, hasNotifications] = await Promise.all([
+        Order.exists({ assigned_agent: id }),
+        Order.exists({ 'rejected_agents.agent_id': id }),
+        AgentEarning.exists({ agent_id: id }),
+        Notification.exists({ agent_id: id }),
+    ]);
+    if (hasOrderHistory || hasRejectionHistory || hasEarnings || hasNotifications) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'This agent has order, earnings, or notification history and cannot be deleted. Set the agent to inactive instead to preserve that history.'
+        });
+    }
+
+    await DeliveryAgent.findByIdAndDelete(id);
     res.status(200).json({ status: 'success', message: 'Agent deleted successfully' });
 });
 

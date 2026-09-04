@@ -157,6 +157,13 @@ paths:
       tags:
         - Delivery Agent (Admin)
       summary: Create a new delivery agent
+      description: >
+        email is validated as a proper email format and stored
+        lowercased/trimmed (case-insensitive uniqueness). mobile is
+        validated as a Saudi Arabia number - accepts 05XXXXXXXX, 5XXXXXXXX,
+        +9665XXXXXXXX, 9665XXXXXXXX, or 009665XXXXXXXX, and is normalized
+        and stored as +9665XXXXXXXX regardless of the input form. Both
+        email and mobile are unique - duplicates return 400.
       security:
         - bearerAuth: []
       requestBody:
@@ -165,11 +172,11 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [name, email, mobile, password]
+              required: [name, email, mobile, password, vehicle_type]
               properties:
                 name: { type: string }
                 email: { type: string, format: email }
-                mobile: { type: string, example: "1234567890" }
+                mobile: { type: string, example: "0501234567", description: "Saudi Arabia number, any common input form - normalized to +9665XXXXXXXX on save" }
                 password: { type: string, minLength: 6 }
                 vehicle_type: { type: string, enum: [bike, car, van, other] }
                 status: { type: string, enum: [active, inactive] }
@@ -178,7 +185,15 @@ paths:
         '201':
           description: Agent created successfully
         '400':
-          $ref: '#/components/responses/ValidationError'
+          description: Validation failed (invalid email/mobile format, etc.), or email/mobile already exists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: error }
+                  message: { type: string, example: "Email already exists" }
+                  errors: { type: object }
 
   /api/V1/admin/delivery-agent/list:
     get:
@@ -219,6 +234,10 @@ paths:
       tags:
         - Delivery Agent (Admin)
       summary: Update a delivery agent (Excluding Password)
+      description: >
+        Same email/mobile validation and normalization as create above -
+        all fields optional (update just what you send). password is
+        ignored here even if sent - use update-password below instead.
       security:
         - bearerAuth: []
       parameters:
@@ -234,13 +253,15 @@ paths:
               properties:
                 name: { type: string }
                 email: { type: string, format: email }
-                mobile: { type: string }
+                mobile: { type: string, example: "0501234567", description: "Saudi Arabia number, any common input form - normalized to +9665XXXXXXXX on save" }
                 vehicle_type: { type: string, enum: [bike, car, van, other] }
                 status: { type: string, enum: [active, inactive] }
                 avatar: { type: string, format: binary }
       responses:
         '200':
           description: Agent updated successfully
+        '400':
+          description: Validation failed (invalid email/mobile format, etc.), or email/mobile already exists
   /api/V1/admin/delivery-agent/update-password/{id}:
     put:
       tags:
@@ -271,6 +292,13 @@ paths:
       tags:
         - Delivery Agent (Admin)
       summary: Delete a delivery agent
+      description: >
+        Blocked (400) if the agent currently has a Pending or Picked Up
+        order assigned (actively working right now), or if the agent has
+        ANY historical dependency (past orders, a rejected-order record,
+        earnings, or notifications) - hard-deleting would leave those
+        records pointing at a nonexistent agent. Set status to inactive
+        instead of deleting an agent with real history.
       security:
         - bearerAuth: []
       parameters:
@@ -281,6 +309,10 @@ paths:
       responses:
         '200':
           description: Agent deleted successfully
+        '400':
+          description: Agent has an active assignment, or has order/earnings/notification history
+        '404':
+          description: Agent not found
 
   /api/V1/admin/delivery-agent/assign-order:
     post:

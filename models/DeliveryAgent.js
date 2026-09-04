@@ -3,12 +3,19 @@ const bcrypt = require('bcryptjs');
 
 const deliveryAgentSchema = new mongoose.Schema({
   name: { type: String, required: [true, "Name is required"] },
-  email: { type: String, required: [true, "Email is required"], unique: true },
-  mobile: { 
-    type: String, 
-    required: [true, "Mobile number is required"], 
-    unique: true,
-    match: [/^\d{10}$/, "Mobile number must be exactly 10 digits"]
+  // lowercase+trim so "Test@x.com" and "test@x.com" collide as the same
+  // email against the unique index - format itself is validated by Zod
+  // (validations/deliveryAgentValidation.js) before this is ever reached.
+  email: { type: String, required: [true, "Email is required"], unique: true, lowercase: true, trim: true },
+  // Format (Saudi Arabia numbers, normalized to +9665XXXXXXXX) is validated
+  // and normalized by Zod before this is reached - no format regex here,
+  // just required+unique, so this document can still be saved/updated for
+  // any pre-existing agent regardless of what format their mobile was
+  // originally stored in.
+  mobile: {
+    type: String,
+    required: [true, "Mobile number is required"],
+    unique: true
   },
   // select: false - never returned by a normal query/toObject(), so it can't
   // leak through profile/list/details responses (formatAgent etc. spread the
